@@ -64,6 +64,44 @@ from agent.delegation_context import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_outcome_receipt(job: dict, not_before: float) -> Optional[str]:
+    """Return a failure reason when a configured semantic receipt is invalid.
+
+    This is deliberately opt-in per job. It converts "the agent tried" into a
+    scheduler failure only for workflows whose owning verifier writes a fresh,
+    machine-readable receipt. Ordinary cron jobs keep their current behavior.
+    """
+    configured = job.get("outcome_receipt_path")
+    if not configured:
+        return None
+    path = Path(str(configured)).expanduser()
+    if not path.is_absolute():
+        return "outcome receipt path must be absolute"
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        return f"required outcome receipt is missing: {exc}"
+    if stat.st_size <= 0 or stat.st_size > 1024 * 1024:
+        return "required outcome receipt is empty or exceeds 1 MiB"
+    # A stale pass from yesterday must not bless today's attempted action.
+    if stat.st_mtime + 1.0 < not_before:
+        return "required outcome receipt is stale for this execution"
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"required outcome receipt is invalid JSON: {exc}"
+    if not isinstance(receipt, dict):
+        return "required outcome receipt root must be an object"
+    expected_workflow = job.get("outcome_receipt_workflow")
+    if expected_workflow and receipt.get("workflow") != expected_workflow:
+        return "required outcome receipt belongs to a different workflow"
+    if receipt.get("status") != "pass":
+        failures = receipt.get("failures")
+        detail = "; ".join(str(item) for item in failures[:3]) if isinstance(failures, list) else ""
+        return f"semantic outcome verification failed{': ' + detail if detail else ''}"
+    return None
+
+
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's timeout.
 
@@ -7126,6 +7164,7 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _outcome_receipt_not_before = time.time()
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
@@ -7151,6 +7190,14 @@ def _run_one_job_body(
             raise
         finally:
             reset_secret_scope(_scope_token)
+
+        if success:
+            _outcome_error = _validate_outcome_receipt(
+                job, _outcome_receipt_not_before
+            )
+            if _outcome_error:
+                success = False
+                error = _outcome_error
 
         if _fire_claim_ownership_lost():
             for _deferred_agent in _deferred_agents:
