@@ -64,7 +64,14 @@ from agent.delegation_context import (
 logger = logging.getLogger(__name__)
 
 
-def _validate_outcome_receipt(job: dict, not_before: float) -> Optional[str]:
+_OUTCOME_RECEIPT_SCHEMA = "aime.hermes-workflow-outcome.v1"
+
+
+def _validate_outcome_receipt(
+    job: dict,
+    not_before: float,
+    expected_run_id: Optional[str] = None,
+) -> Optional[str]:
     """Return a failure reason when a configured semantic receipt is invalid.
 
     This is deliberately opt-in per job. It converts "the agent tried" into a
@@ -92,9 +99,13 @@ def _validate_outcome_receipt(job: dict, not_before: float) -> Optional[str]:
         return f"required outcome receipt is invalid JSON: {exc}"
     if not isinstance(receipt, dict):
         return "required outcome receipt root must be an object"
+    if receipt.get("schema") != _OUTCOME_RECEIPT_SCHEMA:
+        return "required outcome receipt has an unknown verifier schema"
     expected_workflow = job.get("outcome_receipt_workflow")
     if expected_workflow and receipt.get("workflow") != expected_workflow:
         return "required outcome receipt belongs to a different workflow"
+    if expected_run_id and receipt.get("run_id") != expected_run_id:
+        return "required outcome receipt belongs to a different execution"
     if receipt.get("status") != "pass":
         failures = receipt.get("failures")
         detail = "; ".join(str(item) for item in failures[:3]) if isinstance(failures, list) else ""
@@ -7164,19 +7175,34 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _outcome_run_id: Optional[str] = None
+        _effective_extra_prompt = extra_prompt
+        if job.get("outcome_receipt_path"):
+            _outcome_run_id = uuid.uuid4().hex
+            _outcome_directive = (
+                "\n\n[HERMES_OUTCOME_EXECUTION_V1]\n"
+                f"This execution's outcome run ID is `{_outcome_run_id}`. "
+                "Pass it to the canonical outcome verifier as "
+                f"`--run-id {_outcome_run_id}`. The scheduler rejects a "
+                "receipt for any other execution.\n"
+                "[/HERMES_OUTCOME_EXECUTION_V1]"
+            )
+            _effective_extra_prompt = (
+                f"{extra_prompt or ''}{_outcome_directive}"
+            )
         _outcome_receipt_not_before = time.time()
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
                     job,
                     defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
+                    extra_prompt=_effective_extra_prompt,
                 )
             else:
                 success, output, final_response, error = run_job(
                     job,
                     defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
+                    extra_prompt=_effective_extra_prompt,
                     cancel_event=fire_claim_lost,
                 )
         except BaseException:
@@ -7193,7 +7219,9 @@ def _run_one_job_body(
 
         if success:
             _outcome_error = _validate_outcome_receipt(
-                job, _outcome_receipt_not_before
+                job,
+                _outcome_receipt_not_before,
+                expected_run_id=_outcome_run_id,
             )
             if _outcome_error:
                 success = False

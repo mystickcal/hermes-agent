@@ -35,7 +35,7 @@ class TestOutcomeReceiptGate:
 
     def test_failed_or_wrong_workflow_receipt_is_rejected(self, tmp_path):
         path = tmp_path / "receipt.json"
-        path.write_text(json.dumps({"workflow": "other", "status": "fail", "failures": ["queue row absent"]}))
+        path.write_text(json.dumps({"schema": "aime.hermes-workflow-outcome.v1", "workflow": "other", "status": "fail", "failures": ["queue row absent"]}))
         os.utime(path, (200.0, 200.0))
         error = _validate_outcome_receipt(
             {
@@ -48,7 +48,7 @@ class TestOutcomeReceiptGate:
 
     def test_fresh_matching_pass_is_accepted(self, tmp_path):
         path = tmp_path / "receipt.json"
-        path.write_text(json.dumps({"workflow": "eunice-review", "status": "pass", "failures": []}))
+        path.write_text(json.dumps({"schema": "aime.hermes-workflow-outcome.v1", "workflow": "eunice-review", "run_id": "run-new", "status": "pass", "failures": []}))
         os.utime(path, (200.0, 200.0))
         assert _validate_outcome_receipt(
             {
@@ -56,14 +56,42 @@ class TestOutcomeReceiptGate:
                 "outcome_receipt_workflow": "eunice-review",
             },
             100.0,
+            expected_run_id="run-new",
         ) is None
 
     def test_stale_pass_is_rejected(self, tmp_path):
         path = tmp_path / "receipt.json"
-        path.write_text(json.dumps({"workflow": "eunice-review", "status": "pass"}))
+        path.write_text(json.dumps({"schema": "aime.hermes-workflow-outcome.v1", "workflow": "eunice-review", "status": "pass"}))
         os.utime(path, (100.0, 100.0))
         assert "stale" in _validate_outcome_receipt(
             {"outcome_receipt_path": str(path)}, 200.0
+        )
+
+    def test_touched_prior_pass_with_wrong_run_id_is_rejected(self, tmp_path):
+        path = tmp_path / "receipt.json"
+        path.write_text(json.dumps({
+            "schema": "aime.hermes-workflow-outcome.v1",
+            "workflow": "eunice-review",
+            "run_id": "run-old",
+            "status": "pass",
+        }))
+        os.utime(path, (200.0, 200.0))
+        error = _validate_outcome_receipt(
+            {
+                "outcome_receipt_path": str(path),
+                "outcome_receipt_workflow": "eunice-review",
+            },
+            100.0,
+            expected_run_id="run-new",
+        )
+        assert "different execution" in error
+
+    def test_unknown_verifier_schema_is_rejected(self, tmp_path):
+        path = tmp_path / "receipt.json"
+        path.write_text(json.dumps({"schema": "other", "status": "pass"}))
+        os.utime(path, (200.0, 200.0))
+        assert "unknown verifier schema" in _validate_outcome_receipt(
+            {"outcome_receipt_path": str(path)}, 100.0
         )
 
 
@@ -1572,6 +1600,27 @@ class TestSilentDelivery:
             from cron.scheduler import tick
             tick(verbose=False)
         deliver_mock.assert_called_once()
+
+    def test_missing_semantic_receipt_records_failed_execution(self, tmp_path):
+        job = self._make_job()
+        job.update({
+            "outcome_receipt_path": str(tmp_path / "missing.json"),
+            "outcome_receipt_workflow": "eunice-review",
+        })
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "claimed success", None)) as run_mock, \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert "HERMES_OUTCOME_EXECUTION_V1" in run_mock.call_args.kwargs["extra_prompt"]
+        marked = mark_mock.call_args.args
+        assert marked[0] == "monitor-job"
+        assert marked[1] is False
+        assert "outcome receipt is missing" in marked[2]
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
