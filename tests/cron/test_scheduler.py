@@ -19,10 +19,52 @@ from cron.scheduler import (
     _resolve_origin,
     _send_media_via_adapter,
     _summarize_cron_failure_for_delivery,
+    _validate_outcome_receipt,
     run_job,
 )
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestOutcomeReceiptGate:
+    def test_missing_receipt_fails_closed(self, tmp_path):
+        error = _validate_outcome_receipt(
+            {"outcome_receipt_path": str(tmp_path / "missing.json")}, 100.0
+        )
+        assert "missing" in error
+
+    def test_failed_or_wrong_workflow_receipt_is_rejected(self, tmp_path):
+        path = tmp_path / "receipt.json"
+        path.write_text(json.dumps({"workflow": "other", "status": "fail", "failures": ["queue row absent"]}))
+        os.utime(path, (200.0, 200.0))
+        error = _validate_outcome_receipt(
+            {
+                "outcome_receipt_path": str(path),
+                "outcome_receipt_workflow": "eunice-review",
+            },
+            100.0,
+        )
+        assert "different workflow" in error
+
+    def test_fresh_matching_pass_is_accepted(self, tmp_path):
+        path = tmp_path / "receipt.json"
+        path.write_text(json.dumps({"workflow": "eunice-review", "status": "pass", "failures": []}))
+        os.utime(path, (200.0, 200.0))
+        assert _validate_outcome_receipt(
+            {
+                "outcome_receipt_path": str(path),
+                "outcome_receipt_workflow": "eunice-review",
+            },
+            100.0,
+        ) is None
+
+    def test_stale_pass_is_rejected(self, tmp_path):
+        path = tmp_path / "receipt.json"
+        path.write_text(json.dumps({"workflow": "eunice-review", "status": "pass"}))
+        os.utime(path, (100.0, 100.0))
+        assert "stale" in _validate_outcome_receipt(
+            {"outcome_receipt_path": str(path)}, 200.0
+        )
 
 
 class TestSummarizeCronFailureForDelivery:
