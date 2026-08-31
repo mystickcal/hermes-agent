@@ -534,7 +534,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None,
     ):
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import _builtin_provider_dispatch, tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -584,13 +584,14 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
-                    cron_tick(
-                        verbose=False,
-                        adapters=adapters,
-                        loop=loop,
-                        sync=False,
-                        can_dispatch=can_dispatch,
-                    )
+                    with _builtin_provider_dispatch():
+                        cron_tick(
+                            verbose=False,
+                            adapters=adapters,
+                            loop=loop,
+                            sync=False,
+                            can_dispatch=can_dispatch,
+                        )
                 ok = True
             except BaseException as e:
                 # Catch BaseException (not just Exception) so a SystemExit from
@@ -640,7 +641,7 @@ class InProcessCronScheduler(CronScheduler):
         ``web_server.py`` scopes per-profile cron API calls.
         """
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import _builtin_provider_dispatch, tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -686,13 +687,14 @@ class InProcessCronScheduler(CronScheduler):
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
-                                cron_tick(
-                                    verbose=False,
-                                    adapters=adapters,
-                                    loop=loop,
-                                    sync=False,
-                                    can_dispatch=can_dispatch,
-                                )
+                                with _builtin_provider_dispatch():
+                                    cron_tick(
+                                        verbose=False,
+                                        adapters=adapters,
+                                        loop=loop,
+                                        sync=False,
+                                        can_dispatch=can_dispatch,
+                                    )
                         finally:
                             reset_hermes_home_override(home_token)
                 ok = True
