@@ -105,32 +105,55 @@ class TestOutcomeReceiptGate:
 class TestProtectedExternalScriptGate:
     SCRIPT_PATH = Path("/usr/local/libexec/aime-example/run.sh")
     RECEIPT_PATH = Path("/var/lib/aime-example/deployment.json")
+    AUTOMATION_ID = "A164"
+    JOB_ID = "2ba9cfcc8cad"
+    SOURCE_COMMIT = "a" * 40
+    RELEASE = Path("/usr/local/libexec/aime-example/releases") / SOURCE_COMMIT
+    MANIFEST_PATH = RELEASE / "release.json"
 
     @staticmethod
-    def _fixture():
+    def _canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    @classmethod
+    def _fixture(cls):
         script = b"#!/bin/bash\nprintf 'ok\\n'\n"
         script_sha = hashlib.sha256(script).hexdigest()
-        receipt = json.dumps(
-            {
-                "schema": "aime.example.deployment.v1",
-                "status": "active",
-                "source_commit": "a" * 40,
-                "manifest_sha256": "b" * 64,
-                "hermes_script": {
-                    "schema": "aime.hermes-protected-script.v1",
-                    "path": str(TestProtectedExternalScriptGate.SCRIPT_PATH),
-                    "sha256": script_sha,
-                },
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+        binding = {
+            "schema": "aime.hermes-protected-script.v1",
+            "path": str(cls.SCRIPT_PATH),
+            "sha256": script_sha,
+        }
+        manifest = cls._canonical({
+            "schema": "aime.hermes-protected-script-release.v1",
+            "source_commit": cls.SOURCE_COMMIT,
+            "automation_id": cls.AUTOMATION_ID,
+            "native_job_id": cls.JOB_ID,
+            "release": str(cls.RELEASE),
+            "hermes_script": binding,
+        })
+        receipt = cls._canonical({
+            "schema": "aime.hermes-protected-script-deployment.v1",
+            "status": "active",
+            "source_commit": cls.SOURCE_COMMIT,
+            "automation_id": cls.AUTOMATION_ID,
+            "native_job_id": cls.JOB_ID,
+            "release": str(cls.RELEASE),
+            "manifest_path": str(cls.MANIFEST_PATH),
+            "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+            "hermes_script": binding,
+        })
         policy = {
             "schema": "aime.hermes-protected-script.v1",
+            "automation_id": cls.AUTOMATION_ID,
             "script_sha256": script_sha,
-            "deployment_receipt": str(TestProtectedExternalScriptGate.RECEIPT_PATH),
+            "deployment_receipt": str(cls.RECEIPT_PATH),
         }
-        return script, receipt, policy
+        return script, receipt, manifest, policy
+
+    @classmethod
+    def _job(cls, policy):
+        return {"id": cls.JOB_ID, "script_custody": policy}
 
     def test_generic_absolute_script_escape_is_rejected(self):
         ok, error = _run_job_script(str(self.SCRIPT_PATH), job={})
@@ -139,49 +162,219 @@ class TestProtectedExternalScriptGate:
         assert "exact protected script_custody policy" in error
 
     def test_exact_script_and_deployment_receipt_binding_is_accepted(self):
-        script, receipt, policy = self._fixture()
+        script, receipt, manifest, policy = self._fixture()
 
         with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
             "cron.scheduler._read_root_owned_immutable_file",
-            side_effect=[script, receipt],
-        ):
-            error = _authorize_external_job_script(
-                {"script_custody": policy}, self.SCRIPT_PATH
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            descriptor, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
             )
 
+        assert descriptor == 29
         assert error is None
 
     def test_receipt_binding_to_another_path_is_rejected(self):
-        script, receipt, policy = self._fixture()
+        script, receipt, manifest, policy = self._fixture()
         parsed = json.loads(receipt)
         parsed["hermes_script"]["path"] = "/usr/local/libexec/other/run.sh"
-        receipt = json.dumps(
-            parsed, sort_keys=True, separators=(",", ":")
-        ).encode()
+        receipt = self._canonical(parsed)
 
         with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
             "cron.scheduler._read_root_owned_immutable_file",
-            side_effect=[script, receipt],
-        ):
-            error = _authorize_external_job_script(
-                {"script_custody": policy}, self.SCRIPT_PATH
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
             )
 
         assert "different trampoline" in error
 
     def test_script_hash_drift_is_rejected(self):
-        script, receipt, policy = self._fixture()
+        script, receipt, manifest, policy = self._fixture()
         policy["script_sha256"] = "0" * 64
 
         with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
             "cron.scheduler._read_root_owned_immutable_file",
-            side_effect=[script, receipt],
-        ):
-            error = _authorize_external_job_script(
-                {"script_custody": policy}, self.SCRIPT_PATH
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
             )
 
         assert "script bytes do not match" in error
+
+    def test_foreign_receipt_schema_is_rejected(self):
+        script, receipt, manifest, policy = self._fixture()
+        parsed = json.loads(receipt)
+        parsed["schema"] = "aime.foreign.v1"
+        receipt = self._canonical(parsed)
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
+            )
+
+        assert "schema/status is invalid" in error
+
+    def test_receipt_for_foreign_native_job_is_rejected(self):
+        script, receipt, manifest, policy = self._fixture()
+        parsed = json.loads(receipt)
+        parsed["native_job_id"] = "ffffffffffff"
+        receipt = self._canonical(parsed)
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
+            )
+
+        assert "different job" in error
+
+    def test_receipt_for_foreign_automation_is_rejected(self):
+        script, receipt, manifest, policy = self._fixture()
+        parsed = json.loads(receipt)
+        parsed["automation_id"] = "A172"
+        receipt = self._canonical(parsed)
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
+            )
+
+        assert "different job" in error
+
+    def test_manifest_hash_drift_is_rejected(self):
+        script, receipt, manifest, policy = self._fixture()
+        manifest += b" "
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
+            )
+
+        assert "manifest does not match" in error
+
+    def test_foreign_manifest_job_binding_is_rejected(self):
+        script, receipt, manifest, policy = self._fixture()
+        parsed_manifest = json.loads(manifest)
+        parsed_manifest["native_job_id"] = "ffffffffffff"
+        manifest = self._canonical(parsed_manifest)
+        parsed_receipt = json.loads(receipt)
+        parsed_receipt["manifest_sha256"] = hashlib.sha256(manifest).hexdigest()
+        receipt = self._canonical(parsed_receipt)
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
+            )
+
+        assert "different release" in error
+
+    def test_foreign_manifest_schema_is_rejected(self):
+        script, receipt, manifest, policy = self._fixture()
+        parsed_manifest = json.loads(manifest)
+        parsed_manifest["schema"] = "aime.foreign-release.v1"
+        manifest = self._canonical(parsed_manifest)
+        parsed_receipt = json.loads(receipt)
+        parsed_receipt["manifest_sha256"] = hashlib.sha256(manifest).hexdigest()
+        receipt = self._canonical(parsed_receipt)
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
+            )
+
+        assert "different release" in error
+
+    def test_mutable_release_alias_is_rejected(self):
+        script, receipt, manifest, policy = self._fixture()
+        parsed = json.loads(receipt)
+        mutable_release = Path("/usr/local/libexec/aime-example/releases/current")
+        parsed["release"] = str(mutable_release)
+        parsed["manifest_path"] = str(mutable_release / "release.json")
+        receipt = self._canonical(parsed)
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            return_value=receipt,
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(
+                self._job(policy), self.SCRIPT_PATH
+            )
+
+        assert "invalid release manifest path" in error
+
+    def test_swap_after_authorization_executes_validated_inode(self, tmp_path):
+        script_path = tmp_path / "protected.sh"
+        replacement = tmp_path / "replacement.sh"
+        script_path.write_text("#!/bin/bash\nprintf 'approved\\n'\n")
+        replacement.write_text("#!/bin/bash\nprintf 'swapped\\n'\n")
+
+        def authorize_then_swap(job, path):
+            descriptor = os.open(path, os.O_RDONLY)
+            os.replace(replacement, path)
+            return descriptor, None
+
+        with patch(
+            "cron.scheduler._authorize_external_job_script",
+            side_effect=authorize_then_swap,
+        ):
+            ok, output = _run_job_script(
+                str(script_path), job={"id": self.JOB_ID}
+            )
+
+        assert ok is True
+        assert output == "approved"
+        assert "swapped" in script_path.read_text()
 
     @pytest.mark.skipif(os.name == "nt", reason="root custody is Unix-only")
     def test_root_custody_reader_accepts_stable_descriptor_identity(self):
@@ -205,7 +398,9 @@ class TestProtectedExternalScriptGate:
             side_effect=[directory, directory, directory, directory, directory, regular, regular],
         ), patch("os.open", return_value=23), patch(
             "os.fstat", side_effect=[regular, regular]
-        ), patch("os.read", side_effect=[payload, b""]), patch("os.close"):
+        ), patch("os.read", side_effect=[payload, b""]), patch(
+            "os.lseek"
+        ), patch("os.close"):
             result = _read_root_owned_immutable_file(path, label="test fixture")
 
         assert result == payload

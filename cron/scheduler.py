@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 
 _OUTCOME_RECEIPT_SCHEMA = "aime.hermes-workflow-outcome.v1"
 _PROTECTED_SCRIPT_SCHEMA = "aime.hermes-protected-script.v1"
+_PROTECTED_SCRIPT_DEPLOYMENT_SCHEMA = "aime.hermes-protected-script-deployment.v1"
+_PROTECTED_SCRIPT_RELEASE_SCHEMA = "aime.hermes-protected-script-release.v1"
 _MAX_PROTECTED_TRAMPOLINE_BYTES = 1024 * 1024
 
 
@@ -4269,18 +4271,20 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
-def _read_root_owned_immutable_file(
+def _open_root_owned_immutable_file(
     path: Path,
     *,
     label: str,
     max_bytes: int = _MAX_PROTECTED_TRAMPOLINE_BYTES,
-) -> bytes:
-    """Descriptor-read one root-custodied file without following links.
+) -> tuple[int, bytes]:
+    """Open and descriptor-read one root-custodied file without links.
 
     Every path component must be root-owned and non-writable by group/other.
     The final file must also be a single-linked regular file.  The descriptor,
     pathname, and metadata are compared before and after the bounded read so a
-    rename or content change during validation fails closed.
+    rename or content change during validation fails closed.  Ownership of the
+    returned descriptor transfers to the caller so execution can use the exact
+    validated inode instead of reopening a pathname.
     """
     if os.name == "nt":
         raise ValueError(f"{label} custody is unsupported on Windows")
@@ -4374,13 +4378,33 @@ def _read_root_owned_immutable_file(
             or pathname_after.st_nlink != 1
         ):
             raise ValueError(f"{label} pathname changed during validation")
-        return payload
-    finally:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor, payload
+    except BaseException:
         os.close(descriptor)
+        raise
 
 
-def _authorize_external_job_script(job: Optional[dict], path: Path) -> Optional[str]:
-    """Return a reason when an external protected trampoline is not allowed.
+def _read_root_owned_immutable_file(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = _MAX_PROTECTED_TRAMPOLINE_BYTES,
+) -> bytes:
+    """Read a protected file and close its validated descriptor."""
+    descriptor, payload = _open_root_owned_immutable_file(
+        path,
+        label=label,
+        max_bytes=max_bytes,
+    )
+    os.close(descriptor)
+    return payload
+
+
+def _authorize_external_job_script(
+    job: Optional[dict], path: Path,
+) -> tuple[Optional[int], Optional[str]]:
+    """Return the validated script descriptor or a rejection reason.
 
     The mutable cron record is not authority by itself.  It must bind the exact
     trampoline SHA-256 and exact root-custodied deployment receipt path, while
@@ -4389,54 +4413,125 @@ def _authorize_external_job_script(job: Optional[dict], path: Path) -> Optional[
     an absolute script escape hatch.
     """
     if path.suffix.lower() not in {".py", ".sh", ".bash"}:
-        return "protected external script must be a .py, .sh, or .bash trampoline"
+        return None, "protected external script must be a .py, .sh, or .bash trampoline"
     policy = job.get("script_custody") if isinstance(job, dict) else None
     required_policy_keys = {
         "schema",
+        "automation_id",
         "script_sha256",
         "deployment_receipt",
     }
     if not isinstance(policy, dict) or set(policy) != required_policy_keys:
-        return "external script requires an exact protected script_custody policy"
+        return None, "external script requires an exact protected script_custody policy"
     if policy.get("schema") != _PROTECTED_SCRIPT_SCHEMA:
-        return "external script custody policy has an unknown schema"
+        return None, "external script custody policy has an unknown schema"
 
     script_sha256 = str(policy.get("script_sha256") or "")
+    automation_id = str(policy.get("automation_id") or "")
+    native_job_id = str(job.get("id") or "") if isinstance(job, dict) else ""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", automation_id):
+        return None, "external script custody has an invalid automation identity"
+    if not re.fullmatch(r"[0-9a-f]{12}", native_job_id):
+        return None, "external script custody requires an exact native job identity"
     if not re.fullmatch(r"[0-9a-f]{64}", script_sha256):
-        return "external script custody has an invalid script SHA-256"
+        return None, "external script custody has an invalid script SHA-256"
 
+    script_descriptor: Optional[int] = None
     try:
         receipt_path = Path(str(policy.get("deployment_receipt") or ""))
         if not receipt_path.is_absolute() or receipt_path == path:
-            return "external script deployment receipt path is invalid"
-        script_bytes = _read_root_owned_immutable_file(path, label="external script")
+            return None, "external script deployment receipt path is invalid"
+        script_descriptor, script_bytes = _open_root_owned_immutable_file(
+            path, label="external script",
+        )
         receipt_bytes = _read_root_owned_immutable_file(
             receipt_path,
             label="external script deployment receipt",
         )
     except (OSError, ValueError, RuntimeError) as exc:
-        return f"external script custody validation failed: {exc}"
+        if script_descriptor is not None:
+            os.close(script_descriptor)
+        return None, f"external script custody validation failed: {exc}"
 
     if hashlib.sha256(script_bytes).hexdigest() != script_sha256:
-        return "external script bytes do not match the custody SHA-256"
+        os.close(script_descriptor)
+        return None, "external script bytes do not match the custody SHA-256"
     try:
         receipt = json.loads(receipt_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        return f"external script deployment receipt is invalid JSON: {exc}"
-    if not isinstance(receipt, dict) or receipt.get("status") != "active":
-        return "external script deployment receipt is not active"
-    if not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_commit") or "")):
-        return "external script deployment receipt lacks an exact source commit"
-    if not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("manifest_sha256") or "")):
-        return "external script deployment receipt lacks an exact manifest SHA-256"
+        os.close(script_descriptor)
+        return None, f"external script deployment receipt is invalid JSON: {exc}"
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema") != _PROTECTED_SCRIPT_DEPLOYMENT_SCHEMA
+        or receipt.get("status") != "active"
+    ):
+        os.close(script_descriptor)
+        return None, "external script deployment receipt schema/status is invalid"
+    if (
+        receipt.get("automation_id") != automation_id
+        or receipt.get("native_job_id") != native_job_id
+    ):
+        os.close(script_descriptor)
+        return None, "external script deployment receipt belongs to a different job"
+    source_commit = str(receipt.get("source_commit") or "")
+    manifest_sha256 = str(receipt.get("manifest_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        os.close(script_descriptor)
+        return None, "external script deployment receipt lacks an exact source commit"
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256):
+        os.close(script_descriptor)
+        return None, "external script deployment receipt lacks an exact manifest SHA-256"
     expected_binding = {
         "schema": _PROTECTED_SCRIPT_SCHEMA,
         "path": str(path),
         "sha256": script_sha256,
     }
     if receipt.get("hermes_script") != expected_binding:
-        return "external script deployment receipt binds a different trampoline"
-    return None
+        os.close(script_descriptor)
+        return None, "external script deployment receipt binds a different trampoline"
+
+    release = Path(str(receipt.get("release") or ""))
+    manifest_path = Path(str(receipt.get("manifest_path") or ""))
+    if (
+        not release.is_absolute()
+        or ".." in release.parts
+        or manifest_path != release / "release.json"
+        or not (
+            release.name == source_commit
+            or re.fullmatch(rf"{source_commit}-[0-9a-f]{{16,64}}", release.name)
+        )
+    ):
+        os.close(script_descriptor)
+        return None, "external script deployment receipt has an invalid release manifest path"
+    try:
+        manifest_bytes = _read_root_owned_immutable_file(
+            manifest_path,
+            label="external script release manifest",
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        os.close(script_descriptor)
+        return None, f"external script release manifest validation failed: {exc}"
+    if hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256:
+        os.close(script_descriptor)
+        return None, "external script release manifest does not match its SHA-256"
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        os.close(script_descriptor)
+        return None, f"external script release manifest is invalid JSON: {exc}"
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != _PROTECTED_SCRIPT_RELEASE_SCHEMA
+        or manifest.get("source_commit") != source_commit
+        or manifest.get("automation_id") != automation_id
+        or manifest.get("native_job_id") != native_job_id
+        or manifest.get("release") != str(release)
+        or manifest.get("hermes_script") != expected_binding
+    ):
+        os.close(script_descriptor)
+        return None, "external script release manifest binds a different release"
+    return script_descriptor, None
 
 
 def _run_job_script(
@@ -4468,8 +4563,9 @@ def _run_job_script(
 
     Args:
         script_path: Path to the script.  Relative paths are resolved
-            against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
-            are also validated to ensure they stay within the scripts dir.
+            against HERMES_HOME/scripts/. Absolute and ~-prefixed paths inside
+            that directory retain the same containment rules; an external
+            absolute path additionally requires the protected custody contract.
         workdir: Optional absolute path to use as the script's cwd.
             When set, the subprocess runs in this directory instead of
             the scripts-dir parent.  The Python process cwd is NEVER
@@ -4514,6 +4610,7 @@ def _run_job_script(
     else:
         path = (scripts_dir / raw).resolve()
 
+    protected_script_descriptor: Optional[int] = None
     # Guard against path traversal, absolute path injection, and symlink
     # escape — scripts MUST reside within HERMES_HOME/scripts/.
     try:
@@ -4524,14 +4621,24 @@ def _run_job_script(
                 "Blocked: external script path must be an exact canonical "
                 f"absolute path: {script_path!r}"
             )
-        custody_error = _authorize_external_job_script(job, path)
+        protected_script_descriptor, custody_error = _authorize_external_job_script(
+            job, path,
+        )
         if custody_error:
             return False, f"Blocked: {custody_error}: {script_path!r}"
 
-    if not path.exists():
-        return False, f"Script not found: {path}"
-    if not path.is_file():
-        return False, f"Script path is not a file: {path}"
+    if protected_script_descriptor is None:
+        if not path.exists():
+            return False, f"Script not found: {path}"
+        if not path.is_file():
+            return False, f"Script path is not a file: {path}"
+        execution_path = str(path)
+    else:
+        proc_fd_root = Path("/proc/self/fd")
+        if not proc_fd_root.is_dir():
+            os.close(protected_script_descriptor)
+            return False, "Blocked: protected script execution requires /proc/self/fd"
+        execution_path = str(proc_fd_root / str(protected_script_descriptor))
 
     script_timeout = _get_script_timeout()
 
@@ -4550,12 +4657,14 @@ def _run_job_script(
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
         if _bash is None:
+            if protected_script_descriptor is not None:
+                os.close(protected_script_descriptor)
             return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        argv = [_bash, execution_path]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -4563,14 +4672,18 @@ def _run_job_script(
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
             # editable installs importable — .pth processing needs
             # site.addsitedir() (see _windows_cron_bootstrap_argv).
-            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
+            argv = _windows_cron_bootstrap_argv(
+                python_exe, env_overlay, execution_path,
+            )
         else:
-            argv = [python_exe, str(path)]
+            argv = [python_exe, execution_path]
 
     try:
         from tools.environments.local import build_subprocess_env
 
         popen_kwargs: dict[str, Any] = {"start_new_session": True}
+        if protected_script_descriptor is not None:
+            popen_kwargs["pass_fds"] = (protected_script_descriptor,)
         if sys.platform == "win32":
             popen_kwargs = {
                 "creationflags": windows_hide_flags()
@@ -4585,15 +4698,20 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=_script_cwd,
-            env=env,
-            **popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=_script_cwd,
+                env=env,
+                **popen_kwargs,
+            )
+        finally:
+            if protected_script_descriptor is not None:
+                os.close(protected_script_descriptor)
+                protected_script_descriptor = None
         deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -4646,6 +4764,8 @@ def _run_job_script(
         return True, stdout
 
     except Exception as exc:
+        if protected_script_descriptor is not None:
+            os.close(protected_script_descriptor)
         return False, f"Script execution failed: {exc}"
 
 
