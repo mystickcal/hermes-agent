@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -72,6 +73,8 @@ _PROTECTED_SCRIPT_DEPLOYMENT_SCHEMA = "aime.hermes-protected-script-deployment.v
 _PROTECTED_SCRIPT_RELEASE_SCHEMA = "aime.hermes-protected-script-release.v1"
 _MAX_PROTECTED_TRAMPOLINE_BYTES = 1024 * 1024
 _OUTCOME_RUN_ID_ENV = "HERMES_OUTCOME_RUN_ID"
+_OUTCOME_CAPABILITY_FD_ENV = "HERMES_OUTCOME_CAPABILITY_FD"
+_OUTCOME_CAPABILITY_HANDSHAKE = b"HERMES_OUTCOME_CAPABILITY_V1"
 _OUTCOME_RUN_CAPABILITY: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "cron_outcome_run_capability", default=None,
 )
@@ -168,10 +171,21 @@ def _is_gateway_main_process() -> bool:
                 return False
             properties[key] = value
         status_after = Path("/proc/self/status").read_text(encoding="ascii")
+        nspid_after_lines = [
+            line for line in status_after.splitlines() if line.startswith("NSpid:")
+        ]
+        if len(nspid_after_lines) != 1:
+            return False
+        pid_values_after = nspid_after_lines[0].split()[1:]
+        if (
+            not pid_values_after
+            or not all(value.isdigit() for value in pid_values_after)
+            or tuple(pid_values_after) != tuple(pid_values)
+        ):
+            return False
         cgroup_after = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
         return (
-            status_before == status_after
-            and cgroup_after == cgroup_lines
+            cgroup_after == cgroup_lines
             and properties == {
                 "MainPID": str(host_pid),
                 "ActiveState": "active",
@@ -181,6 +195,45 @@ def _is_gateway_main_process() -> bool:
         )
     except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
         return False
+
+
+def _send_outcome_capability(
+    proc: subprocess.Popen,
+    channel: socket.socket,
+    outcome_run_id: str,
+    child_fd: int,
+    child_fd_identity: tuple[int, int],
+) -> Optional[str]:
+    """Deliver a run capability only after an exact child-PID handshake.
+
+    The secret never enters argv or environ. The protected trampoline receives
+    only an inherited unnamed socket descriptor, writes the fixed protocol
+    banner plus its PID, then reads one newline-terminated run ID. The parent
+    proves that the exact socket endpoint remains installed in the exact
+    ``Popen`` child before accepting the PID-bound banner.
+    """
+    if sys.platform != "linux":
+        return "protected outcome capability transport is unavailable"
+    try:
+        installed = os.stat(
+            f"/proc/{proc.pid}/fd/{child_fd}",
+            follow_symlinks=True,
+        )
+        if (installed.st_dev, installed.st_ino) != child_fd_identity:
+            return "protected outcome capability socket has foreign process custody"
+        banner = channel.recv(128)
+        expected_banner = _OUTCOME_CAPABILITY_HANDSHAKE + f" {proc.pid}\n".encode("ascii")
+        if banner != expected_banner:
+            return "protected outcome capability handshake is invalid"
+        payload = memoryview(outcome_run_id.encode("ascii") + b"\n")
+        while payload:
+            written = os.write(channel.fileno(), payload)
+            if written <= 0:
+                return "protected outcome capability delivery was incomplete"
+            payload = payload[written:]
+        return None
+    except (OSError, UnicodeError, ValueError):
+        return "protected outcome capability handshake failed"
 
 
 def _job_outcome_capability_eligible(job: dict) -> bool:
@@ -4834,6 +4887,9 @@ def _run_job_script(
 
     protected_script_descriptor: Optional[int] = None
     protected_interpreter_descriptor: Optional[int] = None
+    outcome_capability_parent: Optional[socket.socket] = None
+    outcome_capability_child: Optional[socket.socket] = None
+    outcome_capability_child_identity: Optional[tuple[int, int]] = None
     # Guard against path traversal, absolute path injection, and symlink
     # escape — scripts MUST reside within HERMES_HOME/scripts/.
     try:
@@ -4933,9 +4989,43 @@ def _run_job_script(
         from tools.environments.local import build_subprocess_env
 
         popen_kwargs: dict[str, Any] = {"start_new_session": True}
+        if outcome_run_id is not None:
+            if sys.platform != "linux":
+                if protected_script_descriptor is not None:
+                    os.close(protected_script_descriptor)
+                    protected_script_descriptor = None
+                if protected_interpreter_descriptor is not None:
+                    os.close(protected_interpreter_descriptor)
+                    protected_interpreter_descriptor = None
+                return False, "Blocked: protected outcome capability transport is unavailable"
+            try:
+                outcome_capability_parent, outcome_capability_child = socket.socketpair(
+                    socket.AF_UNIX, socket.SOCK_STREAM,
+                )
+                child_metadata = os.fstat(outcome_capability_child.fileno())
+                outcome_capability_child_identity = (
+                    child_metadata.st_dev, child_metadata.st_ino,
+                )
+                outcome_capability_parent.settimeout(
+                    min(5.0, max(0.1, float(script_timeout)))
+                )
+            except (OSError, ValueError):
+                if outcome_capability_parent is not None:
+                    outcome_capability_parent.close()
+                if outcome_capability_child is not None:
+                    outcome_capability_child.close()
+                if protected_script_descriptor is not None:
+                    os.close(protected_script_descriptor)
+                    protected_script_descriptor = None
+                if protected_interpreter_descriptor is not None:
+                    os.close(protected_interpreter_descriptor)
+                    protected_interpreter_descriptor = None
+                return False, "Blocked: protected outcome capability transport setup failed"
         protected_fds = tuple(
             descriptor for descriptor in (
                 protected_script_descriptor, protected_interpreter_descriptor,
+                outcome_capability_child.fileno()
+                if outcome_capability_child is not None else None,
             ) if descriptor is not None
         )
         if protected_fds:
@@ -4962,11 +5052,13 @@ def _run_job_script(
         else:
             env = build_subprocess_env()
             env.update(env_overlay)
-        # Never trust a capability inherited from the gateway or caller. Only
-        # the built-in ticker's per-dispatch argument may enter the child.
+        # Never trust a capability inherited from the gateway or caller. The
+        # built-in ticker may create the unnamed transport, but the run ID
+        # itself never enters argv or environ.
         env.pop(_OUTCOME_RUN_ID_ENV, None)
+        env.pop(_OUTCOME_CAPABILITY_FD_ENV, None)
         if outcome_run_id is not None:
-            env[_OUTCOME_RUN_ID_ENV] = outcome_run_id
+            env[_OUTCOME_CAPABILITY_FD_ENV] = str(outcome_capability_child.fileno())
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -4983,12 +5075,31 @@ def _run_job_script(
                 **popen_kwargs,
             )
         finally:
+            if outcome_capability_child is not None:
+                outcome_capability_child.close()
+                outcome_capability_child = None
             if protected_script_descriptor is not None:
                 os.close(protected_script_descriptor)
                 protected_script_descriptor = None
             if protected_interpreter_descriptor is not None:
                 os.close(protected_interpreter_descriptor)
                 protected_interpreter_descriptor = None
+        if outcome_capability_parent is not None:
+            try:
+                capability_error = _send_outcome_capability(
+                    proc,
+                    outcome_capability_parent,
+                    outcome_run_id,
+                    int(env[_OUTCOME_CAPABILITY_FD_ENV]),
+                    outcome_capability_child_identity,
+                )
+            finally:
+                outcome_capability_parent.close()
+                outcome_capability_parent = None
+            if capability_error:
+                _terminate_cron_script_tree(proc)
+                _drain_script_pipes(proc)
+                return False, f"Blocked: {capability_error}"
         deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -5041,6 +5152,10 @@ def _run_job_script(
         return True, stdout
 
     except Exception as exc:
+        if outcome_capability_parent is not None:
+            outcome_capability_parent.close()
+        if outcome_capability_child is not None:
+            outcome_capability_child.close()
         if protected_script_descriptor is not None:
             os.close(protected_script_descriptor)
         if protected_interpreter_descriptor is not None:
