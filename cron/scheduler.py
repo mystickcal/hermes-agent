@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 
 
 _OUTCOME_RECEIPT_SCHEMA = "aime.hermes-workflow-outcome.v1"
+_POST_AGENT_OUTCOME_SCHEMA = "aime.hermes-post-agent-outcome.v1"
+_POST_AGENT_OUTCOME_RECEIPT_SCHEMA = "aime.hermes-post-agent-outcome-receipt.v1"
 _PROTECTED_SCRIPT_SCHEMA = "aime.hermes-protected-script.v1"
 _PROTECTED_SCRIPT_DEPLOYMENT_SCHEMA = "aime.hermes-protected-script-deployment.v1"
 _PROTECTED_SCRIPT_RELEASE_SCHEMA = "aime.hermes-protected-script-release.v1"
@@ -75,6 +77,9 @@ _MAX_PROTECTED_TRAMPOLINE_BYTES = 1024 * 1024
 _OUTCOME_RUN_ID_ENV = "HERMES_OUTCOME_RUN_ID"
 _OUTCOME_CAPABILITY_FD_ENV = "HERMES_OUTCOME_CAPABILITY_FD"
 _OUTCOME_CAPABILITY_HANDSHAKE = b"HERMES_OUTCOME_CAPABILITY_V1"
+_POST_AGENT_FINALIZER_FD_ENV = "HERMES_POST_AGENT_FINALIZER_FD"
+_POST_AGENT_FINALIZER_HANDSHAKE = b"HERMES_POST_AGENT_FINALIZER_V1"
+_DEFAULT_OUTCOME_BINDING = object()
 _OUTCOME_RUN_CAPABILITY: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "cron_outcome_run_capability", default=None,
 )
@@ -266,6 +271,49 @@ def _job_outcome_capability_eligible(job: dict) -> bool:
         and script.is_absolute()
         and ".." not in script.parts
         and script.suffix.lower() in {".py", ".sh", ".bash"}
+        and re.fullmatch(r"[0-9a-f]{12}", str(job.get("id") or "")) is not None
+    )
+
+
+def _job_post_agent_outcome_eligible(job: dict) -> bool:
+    """Require the complete protected post-agent finalization contract."""
+    policy = job.get("post_agent_outcome")
+    if not isinstance(policy, dict) or set(policy) != {
+        "schema",
+        "automation_id",
+        "finalizer_path",
+        "finalizer_sha256",
+        "deployment_receipt",
+        "receipt_path",
+        "workflow",
+    }:
+        return False
+    try:
+        finalizer = Path(str(policy.get("finalizer_path") or ""))
+        deployment_receipt = Path(str(policy.get("deployment_receipt") or ""))
+        outcome_receipt = Path(str(policy.get("receipt_path") or ""))
+    except (TypeError, ValueError):
+        return False
+    return (
+        job.get("no_agent") is not True
+        and policy.get("schema") == _POST_AGENT_OUTCOME_SCHEMA
+        and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+            str(policy.get("automation_id") or ""),
+        ) is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(policy.get("finalizer_sha256") or ""),
+        ) is not None
+        and isinstance(policy.get("workflow"), str)
+        and bool(policy["workflow"].strip())
+        and finalizer.is_absolute()
+        and ".." not in finalizer.parts
+        and finalizer.suffix.lower() in {".py", ".sh", ".bash"}
+        and deployment_receipt.is_absolute()
+        and ".." not in deployment_receipt.parts
+        and outcome_receipt.is_absolute()
+        and ".." not in outcome_receipt.parts
+        and len({finalizer, deployment_receipt, outcome_receipt}) == 3
         and re.fullmatch(r"[0-9a-f]{12}", str(job.get("id") or "")) is not None
     )
 
@@ -4657,7 +4705,10 @@ def _open_protected_interpreter(suffix: str) -> int:
 
 
 def _authorize_external_job_script(
-    job: Optional[dict], path: Path,
+    job: Optional[dict],
+    path: Path,
+    *,
+    expected_outcome_binding: Any = _DEFAULT_OUTCOME_BINDING,
 ) -> tuple[Optional[int], Optional[str]]:
     """Return the validated script descriptor or a rejection reason.
 
@@ -4743,7 +4794,9 @@ def _authorize_external_job_script(
         "sha256": script_sha256,
     }
     expected_outcome = None
-    if job.get("outcome_receipt_path") or job.get("outcome_receipt_workflow"):
+    if expected_outcome_binding is not _DEFAULT_OUTCOME_BINDING:
+        expected_outcome = expected_outcome_binding
+    elif job.get("outcome_receipt_path") or job.get("outcome_receipt_workflow"):
         if not _job_outcome_capability_eligible(job):
             os.close(script_descriptor)
             return None, "external script outcome capability policy is incomplete"
@@ -4804,6 +4857,273 @@ def _authorize_external_job_script(
         os.close(script_descriptor)
         return None, "external script release manifest binds a different release"
     return script_descriptor, None
+
+
+def _authorize_post_agent_finalizer(
+    job: dict,
+) -> tuple[Optional[int], Optional[Path], Optional[str]]:
+    """Descriptor-pin a finalizer whose release reciprocally binds this job."""
+    if not _job_post_agent_outcome_eligible(job):
+        return None, None, "post-agent outcome policy is incomplete"
+    policy = job["post_agent_outcome"]
+    finalizer = Path(policy["finalizer_path"])
+    try:
+        if finalizer.resolve(strict=True) != finalizer:
+            return None, None, "post-agent finalizer path is not canonical"
+    except (OSError, RuntimeError):
+        return None, None, "post-agent finalizer path cannot be resolved"
+    outcome_binding = {
+        "schema": _POST_AGENT_OUTCOME_RECEIPT_SCHEMA,
+        "path": policy["receipt_path"],
+        "workflow": policy["workflow"],
+        "job_id": str(job["id"]),
+        "mode": "post_agent",
+        "response_binding": "sha256",
+    }
+    synthetic_job = {
+        "id": job["id"],
+        "script_custody": {
+            "schema": _PROTECTED_SCRIPT_SCHEMA,
+            "automation_id": policy["automation_id"],
+            "script_sha256": policy["finalizer_sha256"],
+            "deployment_receipt": policy["deployment_receipt"],
+        },
+    }
+    descriptor, error = _authorize_external_job_script(
+        synthetic_job,
+        finalizer,
+        expected_outcome_binding=outcome_binding,
+    )
+    if error:
+        return None, None, f"post-agent finalizer authorization failed: {error}"
+    return descriptor, finalizer, None
+
+
+def _validate_post_agent_outcome_receipt(
+    job: dict,
+    *,
+    not_before: float,
+    run_id: str,
+    response_sha256: str,
+) -> Optional[str]:
+    """Validate the finalizer's typed binding to the exact returned bytes."""
+    policy = job.get("post_agent_outcome")
+    if not _job_post_agent_outcome_eligible(job) or not isinstance(policy, dict):
+        return "post-agent outcome policy is incomplete"
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        return "post-agent outcome expected an invalid scheduler run ID"
+    if not re.fullmatch(r"[0-9a-f]{64}", response_sha256):
+        return "post-agent outcome expected an invalid response SHA-256"
+    path = Path(policy["receipt_path"])
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        return "post-agent outcome verification requires O_NOFOLLOW support"
+    descriptor = -1
+    try:
+        path_before = path.lstat()
+        if not stat.S_ISREG(path_before.st_mode) or path_before.st_nlink != 1:
+            return "post-agent outcome receipt must be a single-linked regular file"
+        descriptor = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0))
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > 1024 * 1024
+            or before.st_dev != path_before.st_dev
+            or before.st_ino != path_before.st_ino
+        ):
+            return "post-agent outcome receipt descriptor custody is invalid"
+        raw = os.read(descriptor, 1024 * 1024 + 1)
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+    except OSError as exc:
+        return f"post-agent outcome receipt is missing: {exc}"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    def identity(item):
+        return (
+            item.st_dev,
+            item.st_ino,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+    if (
+        len(raw) != before.st_size
+        or identity(before) != identity(after)
+        or before.st_dev != path_after.st_dev
+        or before.st_ino != path_after.st_ino
+    ):
+        return "post-agent outcome receipt changed during descriptor read"
+    if before.st_mtime + 1.0 < not_before:
+        return "post-agent outcome receipt is stale for this execution"
+    try:
+        receipt = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return f"post-agent outcome receipt is invalid JSON: {exc}"
+    expected = {
+        "schema": _POST_AGENT_OUTCOME_RECEIPT_SCHEMA,
+        "status": "pass",
+        "automation_id": policy["automation_id"],
+        "job_id": str(job["id"]),
+        "workflow": policy["workflow"],
+        "run_id": run_id,
+        "response_sha256": response_sha256,
+    }
+    if not isinstance(receipt, dict) or any(
+        receipt.get(key) != value for key, value in expected.items()
+    ):
+        return "post-agent outcome receipt does not bind the exact execution response"
+    return None
+
+
+def _send_post_agent_payload(
+    proc: subprocess.Popen,
+    channel: socket.socket,
+    *,
+    child_fd: int,
+    child_fd_identity: tuple[int, int],
+    run_id: str,
+    response_bytes: bytes,
+) -> Optional[str]:
+    """Send the hidden run ID and exact response over the PID-bound socket."""
+    if sys.platform != "linux":
+        return "post-agent finalizer transport is unavailable"
+    try:
+        installed = os.stat(f"/proc/{proc.pid}/fd/{child_fd}", follow_symlinks=True)
+        if (installed.st_dev, installed.st_ino) != child_fd_identity:
+            return "post-agent finalizer socket has foreign process custody"
+        banner = channel.recv(128)
+        expected = _POST_AGENT_FINALIZER_HANDSHAKE + f" {proc.pid}\n".encode("ascii")
+        if banner != expected:
+            return "post-agent finalizer handshake is invalid"
+        payload = memoryview(
+            run_id.encode("ascii")
+            + b"\n"
+            + str(len(response_bytes)).encode("ascii")
+            + b"\n"
+            + response_bytes
+        )
+        while payload:
+            written = os.write(channel.fileno(), payload)
+            if written <= 0:
+                return "post-agent finalizer payload delivery was incomplete"
+            payload = payload[written:]
+        return None
+    except (OSError, UnicodeError, ValueError):
+        logger.debug("Post-agent finalizer payload delivery failed", exc_info=True)
+        return "post-agent finalizer payload delivery failed"
+
+
+def _run_post_agent_finalizer(
+    job: dict,
+    response_bytes: bytes,
+    *,
+    run_id: str,
+    not_before: float,
+) -> Optional[str]:
+    """Run the protected finalizer and validate its exact-response receipt."""
+    if (
+        not _job_post_agent_outcome_eligible(job)
+        or not re.fullmatch(r"[0-9a-f]{32}", run_id)
+        or _BUILTIN_PROVIDER_DISPATCH.get() is not _BUILTIN_PROVIDER_SENTINEL
+        or not _is_gateway_main_process()
+    ):
+        return "post-agent outcome capability provenance is invalid"
+    finalizer_descriptor, finalizer_path, custody_error = _authorize_post_agent_finalizer(job)
+    if custody_error or finalizer_descriptor is None or finalizer_path is None:
+        return custody_error or "post-agent finalizer authorization failed"
+
+    interpreter_descriptor: Optional[int] = None
+    parent: Optional[socket.socket] = None
+    child: Optional[socket.socket] = None
+    proc: Optional[subprocess.Popen] = None
+    try:
+        if sys.platform != "linux" or not Path("/proc/self/fd").is_dir():
+            return "post-agent finalizer descriptor execution is unavailable"
+        interpreter_descriptor = _open_protected_interpreter(finalizer_path.suffix.lower())
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        child_metadata = os.fstat(child.fileno())
+        child_identity = (child_metadata.st_dev, child_metadata.st_ino)
+        timeout = min(30.0, max(0.1, float(_get_script_timeout())))
+        parent.settimeout(min(5.0, timeout))
+        child_fd = child.fileno()
+        env = {
+            "HOME": "/var/empty",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+            _POST_AGENT_FINALIZER_FD_ENV: str(child_fd),
+        }
+        argv = [
+            f"/proc/self/fd/{interpreter_descriptor}",
+            f"/proc/self/fd/{finalizer_descriptor}",
+        ]
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            cwd=str(finalizer_path.parent),
+            env=env,
+            start_new_session=True,
+            pass_fds=(finalizer_descriptor, interpreter_descriptor, child_fd),
+        )
+        child.close()
+        child = None
+        os.close(finalizer_descriptor)
+        finalizer_descriptor = None
+        os.close(interpreter_descriptor)
+        interpreter_descriptor = None
+        payload_error = _send_post_agent_payload(
+            proc,
+            parent,
+            child_fd=child_fd,
+            child_fd_identity=child_identity,
+            run_id=run_id,
+            response_bytes=response_bytes,
+        )
+        parent.close()
+        parent = None
+        if payload_error:
+            _terminate_cron_script_tree(proc)
+            _drain_script_pipes(proc)
+            return payload_error
+        try:
+            stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_cron_script_tree(proc)
+            _drain_script_pipes(proc)
+            return "post-agent finalizer timed out"
+        if proc.returncode != 0:
+            detail = (stderr_raw or stdout_raw or b"").decode("utf-8", errors="replace").strip()
+            return f"post-agent finalizer failed with code {proc.returncode}{': ' + detail[:300] if detail else ''}"
+        response_sha256 = hashlib.sha256(response_bytes).hexdigest()
+        return _validate_post_agent_outcome_receipt(
+            job,
+            not_before=not_before,
+            run_id=run_id,
+            response_sha256=response_sha256,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        if proc is not None and proc.poll() is None:
+            _terminate_cron_script_tree(proc)
+            _drain_script_pipes(proc)
+        return f"post-agent finalizer execution failed: {exc}"
+    finally:
+        if parent is not None:
+            parent.close()
+        if child is not None:
+            child.close()
+        if finalizer_descriptor is not None:
+            os.close(finalizer_descriptor)
+        if interpreter_descriptor is not None:
+            os.close(interpreter_descriptor)
 
 
 def _run_job_script(
@@ -7852,6 +8172,19 @@ def _run_one_job_body(
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
 
+        # A protected post-agent policy is an execution mode, not an advisory
+        # receipt hint. Refuse malformed, manual, and non-provider invocations
+        # before the model can perform any work or side effect.
+        if "post_agent_outcome" in job and (
+            not _job_post_agent_outcome_eligible(job)
+            or not re.fullmatch(
+                r"[0-9a-f]{32}", str(_OUTCOME_RUN_CAPABILITY.get() or ""),
+            )
+            or _BUILTIN_PROVIDER_DISPATCH.get() is not _BUILTIN_PROVIDER_SENTINEL
+            or not _is_gateway_main_process()
+        ):
+            raise RuntimeError("post-agent outcome capability provenance is invalid")
+
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
         # gateway profiles / room→profile multiplexing), and cron fires from
@@ -7877,11 +8210,15 @@ def _run_one_job_body(
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         candidate_outcome_run_id = _OUTCOME_RUN_CAPABILITY.get()
+        _post_agent_outcome = _job_post_agent_outcome_eligible(job)
         _outcome_run_id = (
             candidate_outcome_run_id
             if (
                 candidate_outcome_run_id is not None
-                and _job_outcome_capability_eligible(job)
+                and (
+                    _job_outcome_capability_eligible(job)
+                    or _post_agent_outcome
+                )
                 and _BUILTIN_PROVIDER_DISPATCH.get() is _BUILTIN_PROVIDER_SENTINEL
                 and _is_gateway_main_process()
             )
@@ -7889,6 +8226,9 @@ def _run_one_job_body(
         )
         _effective_extra_prompt = extra_prompt
         _outcome_receipt_not_before = time.time()
+        _agent_capability_token = (
+            _OUTCOME_RUN_CAPABILITY.set(None) if _post_agent_outcome else None
+        )
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
@@ -7913,14 +8253,28 @@ def _run_one_job_body(
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
         finally:
+            if _agent_capability_token is not None:
+                _OUTCOME_RUN_CAPABILITY.reset(_agent_capability_token)
             reset_secret_scope(_scope_token)
 
         if success:
-            _outcome_error = _validate_outcome_receipt(
-                job,
-                _outcome_receipt_not_before,
-                expected_run_id=_outcome_run_id,
-            )
+            if "post_agent_outcome" in job:
+                _outcome_error = (
+                    _run_post_agent_finalizer(
+                        job,
+                        final_response.encode("utf-8"),
+                        run_id=_outcome_run_id or "",
+                        not_before=_outcome_receipt_not_before,
+                    )
+                    if _outcome_run_id is not None
+                    else "post-agent outcome capability provenance is invalid"
+                )
+            else:
+                _outcome_error = _validate_outcome_receipt(
+                    job,
+                    _outcome_receipt_not_before,
+                    expected_run_id=_outcome_run_id,
+                )
             if _outcome_error:
                 success = False
                 error = _outcome_error
@@ -8611,7 +8965,10 @@ def tick(
             outcome_run_id = (
                 uuid.uuid4().hex
                 if (
-                    _job_outcome_capability_eligible(claimed_job)
+                    (
+                        _job_outcome_capability_eligible(claimed_job)
+                        or _job_post_agent_outcome_eligible(claimed_job)
+                    )
                     and _BUILTIN_PROVIDER_DISPATCH.get() is _BUILTIN_PROVIDER_SENTINEL
                     and _is_gateway_main_process()
                 )
