@@ -129,7 +129,6 @@ class TestProtectedExternalScriptGate:
             "schema": "aime.hermes-protected-script.v1",
             "script_sha256": script_sha,
             "deployment_receipt": str(TestProtectedExternalScriptGate.RECEIPT_PATH),
-            "deployment_receipt_sha256": hashlib.sha256(receipt).hexdigest(),
         }
         return script, receipt, policy
 
@@ -159,7 +158,6 @@ class TestProtectedExternalScriptGate:
         receipt = json.dumps(
             parsed, sort_keys=True, separators=(",", ":")
         ).encode()
-        policy["deployment_receipt_sha256"] = hashlib.sha256(receipt).hexdigest()
 
         with patch(
             "cron.scheduler._read_root_owned_immutable_file",
@@ -171,9 +169,9 @@ class TestProtectedExternalScriptGate:
 
         assert "different trampoline" in error
 
-    def test_receipt_hash_drift_is_rejected(self):
+    def test_script_hash_drift_is_rejected(self):
         script, receipt, policy = self._fixture()
-        policy["deployment_receipt_sha256"] = "0" * 64
+        policy["script_sha256"] = "0" * 64
 
         with patch(
             "cron.scheduler._read_root_owned_immutable_file",
@@ -183,7 +181,7 @@ class TestProtectedExternalScriptGate:
                 {"script_custody": policy}, self.SCRIPT_PATH
             )
 
-        assert "receipt does not match" in error
+        assert "script bytes do not match" in error
 
     @pytest.mark.skipif(os.name == "nt", reason="root custody is Unix-only")
     def test_root_custody_reader_accepts_stable_descriptor_identity(self):
