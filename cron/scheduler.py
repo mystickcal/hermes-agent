@@ -14,12 +14,14 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -65,6 +67,8 @@ logger = logging.getLogger(__name__)
 
 
 _OUTCOME_RECEIPT_SCHEMA = "aime.hermes-workflow-outcome.v1"
+_PROTECTED_SCRIPT_SCHEMA = "aime.hermes-protected-script.v1"
+_MAX_PROTECTED_TRAMPOLINE_BYTES = 1024 * 1024
 
 
 def _validate_outcome_receipt(
@@ -4265,17 +4269,194 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _read_root_owned_immutable_file(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = _MAX_PROTECTED_TRAMPOLINE_BYTES,
+) -> bytes:
+    """Descriptor-read one root-custodied file without following links.
+
+    Every path component must be root-owned and non-writable by group/other.
+    The final file must also be a single-linked regular file.  The descriptor,
+    pathname, and metadata are compared before and after the bounded read so a
+    rename or content change during validation fails closed.
+    """
+    if os.name == "nt":
+        raise ValueError(f"{label} custody is unsupported on Windows")
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{label} path must be canonical and absolute")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise ValueError(f"{label} custody requires O_NOFOLLOW support")
+
+    current = Path(path.anchor)
+    root_metadata = current.lstat()
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or root_metadata.st_mode & 0o022
+    ):
+        raise ValueError(f"{label} filesystem root custody is invalid")
+    final_metadata = None
+    for component in path.parts[1:]:
+        current /= component
+        metadata = current.lstat()
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise ValueError(f"{label} custody is not root-owned and immutable: {current}")
+        if current == path:
+            final_metadata = metadata
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size <= 0
+                or metadata.st_size > max_bytes
+            ):
+                raise ValueError(f"{label} must be a bounded single-linked regular file")
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"{label} ancestor is not a directory: {current}")
+
+    if final_metadata is None:
+        raise ValueError(f"{label} cannot be the filesystem root")
+
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if (
+            before.st_dev != final_metadata.st_dev
+            or before.st_ino != final_metadata.st_ino
+            or before.st_uid != 0
+            or before.st_mode & 0o022
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > max_bytes
+        ):
+            raise ValueError(f"{label} descriptor custody changed before read")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) != before.st_size
+            or len(payload) > max_bytes
+            or identity
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+        ):
+            raise ValueError(f"{label} changed during validation")
+        pathname_after = path.lstat()
+        if (
+            pathname_after.st_dev != before.st_dev
+            or pathname_after.st_ino != before.st_ino
+            or pathname_after.st_uid != 0
+            or pathname_after.st_mode & 0o022
+            or not stat.S_ISREG(pathname_after.st_mode)
+            or pathname_after.st_nlink != 1
+        ):
+            raise ValueError(f"{label} pathname changed during validation")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _authorize_external_job_script(job: Optional[dict], path: Path) -> Optional[str]:
+    """Return a reason when an external protected trampoline is not allowed.
+
+    The mutable cron record is not authority by itself.  It must bind the exact
+    trampoline and exact root-custodied deployment receipt by SHA-256, while
+    the receipt independently binds that same path/hash to an active immutable
+    source release.  This is intentionally an exact allowlist, not an absolute
+    script escape hatch.
+    """
+    if path.suffix.lower() not in {".py", ".sh", ".bash"}:
+        return "protected external script must be a .py, .sh, or .bash trampoline"
+    policy = job.get("script_custody") if isinstance(job, dict) else None
+    required_policy_keys = {
+        "schema",
+        "script_sha256",
+        "deployment_receipt",
+        "deployment_receipt_sha256",
+    }
+    if not isinstance(policy, dict) or set(policy) != required_policy_keys:
+        return "external script requires an exact protected script_custody policy"
+    if policy.get("schema") != _PROTECTED_SCRIPT_SCHEMA:
+        return "external script custody policy has an unknown schema"
+
+    script_sha256 = str(policy.get("script_sha256") or "")
+    receipt_sha256 = str(policy.get("deployment_receipt_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", script_sha256):
+        return "external script custody has an invalid script SHA-256"
+    if not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256):
+        return "external script custody has an invalid receipt SHA-256"
+
+    try:
+        receipt_path = Path(str(policy.get("deployment_receipt") or ""))
+        if not receipt_path.is_absolute() or receipt_path == path:
+            return "external script deployment receipt path is invalid"
+        script_bytes = _read_root_owned_immutable_file(path, label="external script")
+        receipt_bytes = _read_root_owned_immutable_file(
+            receipt_path,
+            label="external script deployment receipt",
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        return f"external script custody validation failed: {exc}"
+
+    if hashlib.sha256(script_bytes).hexdigest() != script_sha256:
+        return "external script bytes do not match the custody SHA-256"
+    if hashlib.sha256(receipt_bytes).hexdigest() != receipt_sha256:
+        return "external script deployment receipt does not match its SHA-256"
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return f"external script deployment receipt is invalid JSON: {exc}"
+    if not isinstance(receipt, dict) or receipt.get("status") != "active":
+        return "external script deployment receipt is not active"
+    if not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_commit") or "")):
+        return "external script deployment receipt lacks an exact source commit"
+    if not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("manifest_sha256") or "")):
+        return "external script deployment receipt lacks an exact manifest SHA-256"
+    expected_binding = {
+        "schema": _PROTECTED_SCRIPT_SCHEMA,
+        "path": str(path),
+        "sha256": script_sha256,
+    }
+    if receipt.get("hermes_script") != expected_binding:
+        return "external script deployment receipt binds a different trampoline"
+    return None
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    job: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
-    Scripts must reside within HERMES_HOME/scripts/.  Both relative and
-    absolute paths are resolved and validated against this directory to
-    prevent arbitrary script execution via path traversal or absolute
-    path injection.
+    Scripts normally reside within HERMES_HOME/scripts/.  An absolute path
+    outside that directory is allowed only when ``job.script_custody`` binds
+    its exact SHA-256 and an exact root-custodied deployment receipt that
+    independently binds the same protected trampoline.
 
     Supported interpreters (chosen by file extension):
 
@@ -4301,6 +4482,8 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
+        job: Full cron job record. Required only for a protected external
+            trampoline; ordinary scripts retain the existing behavior.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -4342,10 +4525,14 @@ def _run_job_script(
     try:
         path.relative_to(scripts_dir_resolved)
     except ValueError:
-        return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
-        )
+        if not raw.is_absolute() or ".." in raw.parts or raw != path:
+            return False, (
+                "Blocked: external script path must be an exact canonical "
+                f"absolute path: {script_path!r}"
+            )
+        custody_error = _authorize_external_job_script(job, path)
+        if custody_error:
+            return False, f"Blocked: {custody_error}: {script_path!r}"
 
     if not path.exists():
         return False, f"Script not found: {path}"
@@ -4494,7 +4681,9 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, job=job,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4525,10 +4714,14 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, job=job,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, job=job,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -4599,7 +4792,7 @@ def _build_job_prompt(
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, job=job)
         if success:
             if script_output:
                 prompt = (
