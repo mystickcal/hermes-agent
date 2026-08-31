@@ -71,6 +71,42 @@ _PROTECTED_SCRIPT_SCHEMA = "aime.hermes-protected-script.v1"
 _PROTECTED_SCRIPT_DEPLOYMENT_SCHEMA = "aime.hermes-protected-script-deployment.v1"
 _PROTECTED_SCRIPT_RELEASE_SCHEMA = "aime.hermes-protected-script-release.v1"
 _MAX_PROTECTED_TRAMPOLINE_BYTES = 1024 * 1024
+_OUTCOME_RUN_ID_ENV = "HERMES_OUTCOME_RUN_ID"
+
+
+def _is_gateway_main_process() -> bool:
+    """Return true only inside the live systemd Hermes gateway process.
+
+    Semantic receipt capabilities must not be minted by a CLI/manual call to
+    ``tick()``. Linux deployments therefore bind issuance to systemd's exact
+    MainPID through a fixed root-owned binary. Unsupported platforms fail
+    closed for capability-backed jobs while ordinary cron jobs are unchanged.
+    """
+    if sys.platform != "linux":
+        return False
+    systemctl = Path("/usr/bin/systemctl")
+    try:
+        metadata = systemctl.stat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            return False
+        result = subprocess.run(
+            [
+                str(systemctl), "--user", "show",
+                "--property=MainPID", "--value", "hermes-gateway.service",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        value = result.stdout.strip()
+        return result.returncode == 0 and value.isdigit() and int(value) == os.getpid()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
 
 
 def _validate_outcome_receipt(
@@ -110,7 +146,9 @@ def _validate_outcome_receipt(
     expected_workflow = job.get("outcome_receipt_workflow")
     if expected_workflow and receipt.get("workflow") != expected_workflow:
         return "required outcome receipt belongs to a different workflow"
-    if expected_run_id and receipt.get("run_id") != expected_run_id:
+    if expected_run_id is None:
+        return "required outcome receipt has no scheduler-issued execution capability"
+    if receipt.get("run_id") != expected_run_id:
         return "required outcome receipt belongs to a different execution"
     if receipt.get("status") != "pass":
         failures = receipt.get("failures")
@@ -4539,6 +4577,7 @@ def _run_job_script(
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
     job: Optional[dict] = None,
+    outcome_run_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4574,6 +4613,9 @@ def _run_job_script(
             (#69396).
         job: Full cron job record. Required only for a protected external
             trampoline; ordinary scripts retain the existing behavior.
+        outcome_run_id: Scheduler-issued per-execution capability. When
+            present, it is injected only into the child script environment.
+            Parent environment values with the same name are always removed.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -4582,6 +4624,9 @@ def _run_job_script(
     scripts_dir = _get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
+
+    if outcome_run_id is not None and not re.fullmatch(r"[0-9a-f]{32}", outcome_run_id):
+        return False, "Blocked: invalid scheduler-issued outcome execution capability"
 
     # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:
     # a NUL-bearing value can never name a real script, and on Windows the
@@ -4693,6 +4738,11 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        # Never trust a capability inherited from the gateway or caller. Only
+        # the built-in ticker's per-dispatch argument may enter the child.
+        env.pop(_OUTCOME_RUN_ID_ENV, None)
+        if outcome_run_id is not None:
+            env[_OUTCOME_RUN_ID_ENV] = outcome_run_id
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -4774,6 +4824,7 @@ def _run_job_script_with_claim_heartbeat(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    outcome_run_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4797,6 +4848,7 @@ def _run_job_script_with_claim_heartbeat(
     ):
         return _run_job_script(
             script_path, workdir=workdir, cancel_event=cancel_event, job=job,
+            outcome_run_id=outcome_run_id,
         )
 
     job_id = str(job.get("id") or "")
@@ -4830,11 +4882,13 @@ def _run_job_script_with_claim_heartbeat(
         )
         return _run_job_script(
             script_path, workdir=workdir, cancel_event=cancel_event, job=job,
+            outcome_run_id=outcome_run_id,
         )
 
     try:
         return _run_job_script(
             script_path, workdir=workdir, cancel_event=cancel_event, job=job,
+            outcome_run_id=outcome_run_id,
         )
     finally:
         stop.set()
@@ -5727,6 +5781,7 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    outcome_run_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -5744,6 +5799,11 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run',
     prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
     never persisted to the job definition.
+
+    ``outcome_run_id``: an internal capability created only by the built-in
+    ticker after it has durably recorded the execution. It is passed to a
+    no-agent script through a scrubbed child environment and to agent jobs
+    through the bounded execution directive. Direct/manual callers omit it.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -5814,6 +5874,7 @@ def run_job(
         try:
             ok, output = _run_job_script_with_claim_heartbeat(
                 job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
+                outcome_run_id=outcome_run_id,
             )
         except Exception as exc:
             logger.exception(
@@ -7329,6 +7390,7 @@ def run_one_job(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    outcome_run_id: Optional[str] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -7373,6 +7435,7 @@ def run_one_job(
                     else lost_ownership
                 ),
                 execution_token=execution_token,
+                outcome_run_id=outcome_run_id,
             ),
         )
     finally:
@@ -7393,6 +7456,7 @@ def _run_one_job_body(
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
+    outcome_run_id: Optional[str] = None,
 ) -> bool:
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
@@ -7482,21 +7546,21 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
-        _outcome_run_id: Optional[str] = None
+        _outcome_run_id = outcome_run_id
         _effective_extra_prompt = extra_prompt
         if job.get("outcome_receipt_path"):
-            _outcome_run_id = uuid.uuid4().hex
-            _outcome_directive = (
-                "\n\n[HERMES_OUTCOME_EXECUTION_V1]\n"
-                f"This execution's outcome run ID is `{_outcome_run_id}`. "
-                "Pass it to the canonical outcome verifier as "
-                f"`--run-id {_outcome_run_id}`. The scheduler rejects a "
-                "receipt for any other execution.\n"
-                "[/HERMES_OUTCOME_EXECUTION_V1]"
-            )
-            _effective_extra_prompt = (
-                f"{extra_prompt or ''}{_outcome_directive}"
-            )
+            if _outcome_run_id is not None:
+                _outcome_directive = (
+                    "\n\n[HERMES_OUTCOME_EXECUTION_V1]\n"
+                    f"This execution's outcome run ID is `{_outcome_run_id}`. "
+                    "Pass it to the canonical outcome verifier as "
+                    f"`--run-id {_outcome_run_id}`. The scheduler rejects a "
+                    "receipt for any other execution.\n"
+                    "[/HERMES_OUTCOME_EXECUTION_V1]"
+                )
+                _effective_extra_prompt = (
+                    f"{extra_prompt or ''}{_outcome_directive}"
+                )
         _outcome_receipt_not_before = time.time()
         try:
             if fire_claim_lost is None:
@@ -7504,6 +7568,7 @@ def _run_one_job_body(
                     job,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=_effective_extra_prompt,
+                    outcome_run_id=_outcome_run_id,
                 )
             else:
                 success, output, final_response, error = run_job(
@@ -7511,6 +7576,7 @@ def _run_one_job_body(
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=_effective_extra_prompt,
                     cancel_event=fire_claim_lost,
+                    outcome_run_id=_outcome_run_id,
                 )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -8214,11 +8280,23 @@ def tick(
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
+            # Mint semantic-outcome authority only in the built-in ticker,
+            # after its execution row and durable fire claim exist. Manual
+            # ``run_one_job`` callers and external providers receive no token.
+            outcome_run_id = (
+                uuid.uuid4().hex
+                if (
+                    claimed_job.get("outcome_receipt_path")
+                    and _is_gateway_main_process()
+                )
+                else None
+            )
             return run_one_job(
                 claimed_job,
                 adapters=adapters,
                 loop=loop,
                 verbose=verbose,
+                outcome_run_id=outcome_run_id,
             )
 
         # Partition due jobs: those with a per-job workdir mutate
