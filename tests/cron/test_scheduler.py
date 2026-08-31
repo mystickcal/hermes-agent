@@ -24,6 +24,7 @@ from cron.scheduler import (
     _send_media_via_adapter,
     _summarize_cron_failure_for_delivery,
     _authorize_external_job_script,
+    _is_gateway_main_process,
     _read_root_owned_immutable_file,
     _run_job_script,
     _validate_outcome_receipt,
@@ -55,15 +56,16 @@ class TestOutcomeReceiptGate:
 
     def test_fresh_matching_pass_is_accepted(self, tmp_path):
         path = tmp_path / "receipt.json"
-        path.write_text(json.dumps({"schema": "aime.hermes-workflow-outcome.v1", "workflow": "eunice-review", "run_id": "run-new", "status": "pass", "failures": []}))
+        path.write_text(json.dumps({"schema": "aime.hermes-workflow-outcome.v1", "workflow": "eunice-review", "job_id": "abc123def456", "run_id": "a" * 32, "status": "pass", "failures": []}))
         os.utime(path, (200.0, 200.0))
         assert _validate_outcome_receipt(
             {
                 "outcome_receipt_path": str(path),
                 "outcome_receipt_workflow": "eunice-review",
+                "id": "abc123def456",
             },
             100.0,
-            expected_run_id="run-new",
+            expected_run_id="a" * 32,
         ) is None
 
     def test_stale_pass_is_rejected(self, tmp_path):
@@ -79,7 +81,8 @@ class TestOutcomeReceiptGate:
         path.write_text(json.dumps({
             "schema": "aime.hermes-workflow-outcome.v1",
             "workflow": "eunice-review",
-            "run_id": "run-old",
+            "job_id": "abc123def456",
+            "run_id": "b" * 32,
             "status": "pass",
         }))
         os.utime(path, (200.0, 200.0))
@@ -87,9 +90,10 @@ class TestOutcomeReceiptGate:
             {
                 "outcome_receipt_path": str(path),
                 "outcome_receipt_workflow": "eunice-review",
+                "id": "abc123def456",
             },
             100.0,
-            expected_run_id="run-new",
+            expected_run_id="a" * 32,
         )
         assert "different execution" in error
 
@@ -106,6 +110,7 @@ class TestOutcomeReceiptGate:
         path.write_text(json.dumps({
             "schema": "aime.hermes-workflow-outcome.v1",
             "workflow": "a170-youtube-gap-digest",
+            "job_id": "abc123def456",
             "run_id": "a" * 32,
             "status": "pass",
         }))
@@ -115,6 +120,7 @@ class TestOutcomeReceiptGate:
             {
                 "outcome_receipt_path": str(path),
                 "outcome_receipt_workflow": "a170-youtube-gap-digest",
+                "id": "abc123def456",
             },
             100.0,
             expected_run_id=None,
@@ -122,7 +128,7 @@ class TestOutcomeReceiptGate:
 
         assert "no scheduler-issued execution capability" in error
 
-    def test_script_receives_only_explicit_scheduler_capability(self, tmp_path, monkeypatch):
+    def test_script_scrubs_inherited_scheduler_capability(self, tmp_path, monkeypatch):
         scripts = tmp_path / "scripts"
         scripts.mkdir()
         script = scripts / "show_capability.py"
@@ -133,28 +139,55 @@ class TestOutcomeReceiptGate:
 
         with patch("cron.scheduler._get_hermes_home", return_value=tmp_path):
             ok_missing, output_missing = _run_job_script(
-                script.name, job={}, outcome_run_id=None,
-            )
-            ok_bound, output_bound = _run_job_script(
-                script.name, job={}, outcome_run_id="a" * 32,
+                script.name, job={},
             )
 
         assert (ok_missing, output_missing) == (True, "missing")
-        assert (ok_bound, output_bound) == (True, "a" * 32)
 
-    def test_invalid_script_capability_fails_before_execution(self, tmp_path):
+    def test_corrupted_internal_capability_fails_before_execution(self, tmp_path):
         scripts = tmp_path / "scripts"
         scripts.mkdir()
         script = scripts / "must_not_run.py"
         script.write_text("raise SystemExit('ran')\n")
 
-        with patch("cron.scheduler._get_hermes_home", return_value=tmp_path):
+        with patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._OUTCOME_RUN_CAPABILITY", SimpleNamespace(get=lambda: "bad")):
             ok, error = _run_job_script(
-                script.name, job={}, outcome_run_id="not-a-capability",
+                script.name, job={},
             )
 
         assert ok is False
         assert "invalid scheduler-issued" in error
+
+    def test_gateway_main_process_uses_kernel_cgroup_identity(self):
+        cgroup = (
+            "0::/user.slice/user-1000.slice/user@1000.service/"
+            "app.slice/hermes-gateway.service\n"
+        )
+        status = "Name:\thermes\nNSpid:\t2294\t2\n"
+        procs = "2294\n2500\n2600\n"
+
+        with patch("cron.scheduler.os.getuid", return_value=1000), \
+             patch("cron.scheduler.Path.read_text", side_effect=[
+                 cgroup, status, procs, status, cgroup, procs,
+             ]), \
+             patch("cron.scheduler.Path.resolve", autospec=True, side_effect=lambda self, strict: self):
+            assert _is_gateway_main_process() is True
+
+    def test_gateway_child_cannot_attest_as_main_process(self):
+        cgroup = (
+            "0::/user.slice/user-1000.slice/user@1000.service/"
+            "app.slice/hermes-gateway.service\n"
+        )
+        status = "Name:\tchild\nNSpid:\t2500\t3\n"
+        procs = "2294\n2500\n2600\n"
+
+        with patch("cron.scheduler.os.getuid", return_value=1000), \
+             patch("cron.scheduler.Path.read_text", side_effect=[
+                 cgroup, status, procs, status, cgroup, procs,
+             ]), \
+             patch("cron.scheduler.Path.resolve", autospec=True, side_effect=lambda self, strict: self):
+            assert _is_gateway_main_process() is False
 
 
 class TestProtectedExternalScriptGate:
@@ -232,6 +265,59 @@ class TestProtectedExternalScriptGate:
 
         assert descriptor == 29
         assert error is None
+
+    def test_exact_no_agent_outcome_policy_is_bound_by_receipt_and_manifest(self):
+        script, receipt_raw, manifest_raw, policy = self._fixture()
+        outcome = {
+            "schema": "aime.hermes-workflow-outcome.v1",
+            "path": "/var/lib/aime-example/outcome.json",
+            "workflow": "a172-youtube-upload-stuck-watchdog",
+            "job_id": self.JOB_ID,
+            "mode": "no_agent",
+        }
+        manifest = json.loads(manifest_raw)
+        manifest["outcome_receipt"] = outcome
+        manifest_raw = self._canonical(manifest)
+        receipt = json.loads(receipt_raw)
+        receipt["outcome_receipt"] = outcome
+        receipt["manifest_sha256"] = hashlib.sha256(manifest_raw).hexdigest()
+        receipt_raw = self._canonical(receipt)
+        job = self._job(policy) | {
+            "no_agent": True,
+            "outcome_receipt_path": outcome["path"],
+            "outcome_receipt_workflow": outcome["workflow"],
+        }
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[receipt_raw, manifest_raw],
+        ), patch("os.close"):
+            descriptor, error = _authorize_external_job_script(job, self.SCRIPT_PATH)
+
+        assert descriptor == 29
+        assert error is None
+
+    def test_unbound_outcome_policy_is_rejected(self):
+        script, receipt, manifest, policy = self._fixture()
+        job = self._job(policy) | {
+            "no_agent": True,
+            "outcome_receipt_path": "/var/lib/aime-example/outcome.json",
+            "outcome_receipt_workflow": "a172-youtube-upload-stuck-watchdog",
+        }
+
+        with patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, script),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[receipt, manifest],
+        ), patch("os.close"):
+            _, error = _authorize_external_job_script(job, self.SCRIPT_PATH)
+
+        assert "different outcome policy" in error
 
     def test_receipt_binding_to_another_path_is_rejected(self):
         script, receipt, manifest, policy = self._fixture()
@@ -422,6 +508,9 @@ class TestProtectedExternalScriptGate:
         with patch(
             "cron.scheduler._authorize_external_job_script",
             side_effect=authorize_then_swap,
+        ), patch(
+            "cron.scheduler._open_protected_interpreter",
+            side_effect=lambda _suffix: os.open("/usr/bin/bash", os.O_RDONLY),
         ):
             ok, output = _run_job_script(
                 str(script_path), job={"id": self.JOB_ID}
@@ -2013,7 +2102,7 @@ class TestSilentDelivery:
             from cron.scheduler import tick
             tick(verbose=False)
 
-        assert "HERMES_OUTCOME_EXECUTION_V1" in run_mock.call_args.kwargs["extra_prompt"]
+        assert run_mock.call_args.kwargs["extra_prompt"] is None
         marked = mark_mock.call_args.args
         assert marked[0] == "monitor-job"
         assert marked[1] is False
@@ -2357,14 +2446,24 @@ class TestParallelTick:
     def test_builtin_tick_mints_outcome_capability_only_in_gateway_main_process(self):
         captured = []
         job = {
-            "id": "receipt-job",
+            "id": "abc123def456",
             "name": "receipt job",
             "deliver": "local",
+            "no_agent": True,
+            "script": "/usr/local/libexec/aime-example/run.sh",
             "outcome_receipt_path": "/var/lib/aime/receipt.json",
+            "outcome_receipt_workflow": "a170-youtube-gap-digest",
+            "script_custody": {
+                "schema": "aime.hermes-protected-script.v1",
+                "automation_id": "A170",
+                "script_sha256": "b" * 64,
+                "deployment_receipt": "/var/lib/aime/deployment.json",
+            },
         }
 
         def mock_run_job(job, **kwargs):
-            captured.append(kwargs.get("outcome_run_id"))
+            import cron.scheduler as scheduler
+            captured.append(scheduler._OUTCOME_RUN_CAPABILITY.get())
             return (True, "output", "response", None)
 
         with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
@@ -2384,14 +2483,24 @@ class TestParallelTick:
     def test_manual_process_tick_cannot_mint_outcome_capability(self):
         captured = []
         job = {
-            "id": "receipt-job-manual",
+            "id": "def456abc123",
             "name": "receipt job manual",
             "deliver": "local",
+            "no_agent": True,
+            "script": "/usr/local/libexec/aime-example/run.sh",
             "outcome_receipt_path": "/var/lib/aime/receipt.json",
+            "outcome_receipt_workflow": "a170-youtube-gap-digest",
+            "script_custody": {
+                "schema": "aime.hermes-protected-script.v1",
+                "automation_id": "A170",
+                "script_sha256": "b" * 64,
+                "deployment_receipt": "/var/lib/aime/deployment.json",
+            },
         }
 
         def mock_run_job(job, **kwargs):
-            captured.append(kwargs.get("outcome_run_id"))
+            import cron.scheduler as scheduler
+            captured.append(scheduler._OUTCOME_RUN_CAPABILITY.get())
             return (True, "output", "response", None)
 
         with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
