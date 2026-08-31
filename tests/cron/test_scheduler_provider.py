@@ -166,14 +166,25 @@ def test_inprocess_provider_ticks_and_stops():
     """The built-in provider drives cron.scheduler.tick(sync=False) on a loop
     and exits promptly when stop_event is set — same contract as the raw
     ticker characterized above."""
+    from cron.scheduler import (
+        _BUILTIN_PROVIDER_DISPATCH,
+        _BUILTIN_PROVIDER_SENTINEL,
+    )
     from cron.scheduler_provider import InProcessCronScheduler
 
     calls = []
+    dispatch_markers = []
     stop = threading.Event()
     prov = InProcessCronScheduler()
     assert prov.name == "builtin"
+    assert _BUILTIN_PROVIDER_DISPATCH.get() is None
 
-    with patch("cron.scheduler.tick", side_effect=lambda *a, **k: calls.append(k) or 0):
+    def _tracking_tick(*args, **kwargs):
+        calls.append(kwargs)
+        dispatch_markers.append(_BUILTIN_PROVIDER_DISPATCH.get())
+        return 0
+
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick):
         t = threading.Thread(
             target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True
         )
@@ -188,6 +199,8 @@ def test_inprocess_provider_ticks_and_stops():
     assert not t.is_alive(), "provider did not exit after stop_event was set"
     assert len(calls) >= 1, "provider never called tick()"
     assert calls[0].get("sync") is False
+    assert all(marker is _BUILTIN_PROVIDER_SENTINEL for marker in dispatch_markers)
+    assert _BUILTIN_PROVIDER_DISPATCH.get() is None
 
 
 # ── Phase 2: config key, discovery, resolver ─────────────────────────────────
@@ -593,6 +606,10 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     """The multiplex cron scheduler calls tick() once per profile home,
     scoped via use_cron_store, so secondary-profile jobs actually fire
     instead of languishing in an unticked store."""
+    from cron.scheduler import (
+        _BUILTIN_PROVIDER_DISPATCH,
+        _BUILTIN_PROVIDER_SENTINEL,
+    )
     from cron.scheduler_provider import InProcessCronScheduler
 
     # Set up two profile directories.
@@ -605,9 +622,11 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
 
     # Count tick() calls — should be called once per profile per iteration.
     tick_count: list[int] = []
+    dispatch_markers: list[object | None] = []
 
     def _tracking_tick(*args, **kwargs):
         tick_count.append(1)
+        dispatch_markers.append(_BUILTIN_PROVIDER_DISPATCH.get())
         return 0
 
     stop = threading.Event()
@@ -638,5 +657,5 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
-
+    assert all(marker is _BUILTIN_PROVIDER_SENTINEL for marker in dispatch_markers)
+    assert _BUILTIN_PROVIDER_DISPATCH.get() is None
