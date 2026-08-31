@@ -75,15 +75,29 @@ _OUTCOME_RUN_ID_ENV = "HERMES_OUTCOME_RUN_ID"
 _OUTCOME_RUN_CAPABILITY: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "cron_outcome_run_capability", default=None,
 )
+_BUILTIN_PROVIDER_SENTINEL = object()
+_BUILTIN_PROVIDER_DISPATCH: contextvars.ContextVar[Optional[object]] = contextvars.ContextVar(
+    "cron_builtin_provider_dispatch", default=None,
+)
+
+
+@contextlib.contextmanager
+def _builtin_provider_dispatch():
+    """Mark one tick as originating from the in-process provider loop."""
+    token = _BUILTIN_PROVIDER_DISPATCH.set(_BUILTIN_PROVIDER_SENTINEL)
+    try:
+        yield
+    finally:
+        _BUILTIN_PROVIDER_DISPATCH.reset(token)
 
 
 def _is_gateway_main_process() -> bool:
-    """Return true only for the leader of the live gateway's kernel cgroup.
+    """Corroborate this process against systemd's live gateway MainPID.
 
-    This avoids environment-sensitive D-Bus/systemctl lookups. A terminal or
-    MCP child may share the service cgroup, but only the gateway leader has the
-    smallest host PID in ``cgroup.procs``. ``NSpid`` supplies that host PID
-    even when Hermes runs inside a nested PID namespace.
+    The query uses a fixed root-owned executable and a minimal environment
+    bound to the canonical user bus; inherited D-Bus and loader variables are
+    never trusted. ``NSpid`` supplies the host PID inside nested namespaces,
+    and the kernel cgroup is checked independently before/after the query.
     """
     if sys.platform != "linux":
         return False
@@ -96,6 +110,14 @@ def _is_gateway_main_process() -> bool:
         cgroup_lines = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
         if cgroup_lines != [f"0::{expected}"]:
             return False
+        systemctl = Path("/usr/bin/systemctl")
+        systemctl_metadata = systemctl.lstat()
+        if (
+            not stat.S_ISREG(systemctl_metadata.st_mode)
+            or systemctl_metadata.st_uid != 0
+            or systemctl_metadata.st_mode & 0o022
+        ):
+            return False
         status_before = Path("/proc/self/status").read_text(encoding="ascii")
         nspid_lines = [line for line in status_before.splitlines() if line.startswith("NSpid:")]
         if len(nspid_lines) != 1:
@@ -104,23 +126,60 @@ def _is_gateway_main_process() -> bool:
         if not pid_values or not all(value.isdigit() for value in pid_values):
             return False
         host_pid = int(pid_values[0])
-        cgroup_dir = Path("/sys/fs/cgroup") / expected.lstrip("/")
-        if cgroup_dir.resolve(strict=True) != cgroup_dir:
+        runtime_dir = Path(f"/run/user/{uid}")
+        bus = runtime_dir / "bus"
+        runtime_metadata = runtime_dir.lstat()
+        bus_metadata = bus.lstat()
+        if (
+            not stat.S_ISDIR(runtime_metadata.st_mode)
+            or runtime_metadata.st_uid != uid
+            or stat.S_IMODE(runtime_metadata.st_mode) != 0o700
+            or not stat.S_ISSOCK(bus_metadata.st_mode)
+            or bus_metadata.st_uid != uid
+        ):
             return False
-        procs_path = cgroup_dir / "cgroup.procs"
-        procs_before = procs_path.read_text(encoding="ascii").split()
-        if not procs_before or not all(value.isdigit() for value in procs_before):
+        query_env = {
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
+            "HOME": str(Path.home()),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+            "XDG_RUNTIME_DIR": str(runtime_dir),
+        }
+        argv = [
+            str(systemctl), "--user", "show",
+            "--property=MainPID,ActiveState,SubState,ControlGroup",
+            "hermes-gateway.service",
+        ]
+        first = subprocess.run(
+            argv, check=False, capture_output=True, text=True,
+            timeout=2.0, env=query_env,
+        )
+        second = subprocess.run(
+            argv, check=False, capture_output=True, text=True,
+            timeout=2.0, env=query_env,
+        )
+        if first.returncode != 0 or second.returncode != 0 or first.stdout != second.stdout:
             return False
+        properties = {}
+        for line in first.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key in properties:
+                return False
+            properties[key] = value
         status_after = Path("/proc/self/status").read_text(encoding="ascii")
         cgroup_after = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
-        procs_after = procs_path.read_text(encoding="ascii").split()
         return (
             status_before == status_after
             and cgroup_after == cgroup_lines
-            and procs_after == procs_before
-            and host_pid == min(int(value) for value in procs_before)
+            and properties == {
+                "MainPID": str(host_pid),
+                "ActiveState": "active",
+                "SubState": "running",
+                "ControlGroup": expected,
+            }
         )
-    except (OSError, UnicodeError, ValueError):
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
         return False
 
 
@@ -129,8 +188,11 @@ def _job_outcome_capability_eligible(job: dict) -> bool:
     path_text = str(job.get("outcome_receipt_path") or "")
     workflow = job.get("outcome_receipt_workflow")
     policy = job.get("script_custody")
+    script_text = str(job.get("script") or "")
     try:
         path = Path(path_text)
+        script = Path(script_text)
+        deployment_receipt = Path(str(policy.get("deployment_receipt") or "")) if isinstance(policy, dict) else Path()
     except (TypeError, ValueError):
         return False
     return (
@@ -144,6 +206,14 @@ def _job_outcome_capability_eligible(job: dict) -> bool:
             "schema", "automation_id", "script_sha256", "deployment_receipt",
         }
         and policy.get("schema") == _PROTECTED_SCRIPT_SCHEMA
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", str(policy.get("automation_id") or "")) is not None
+        and re.fullmatch(r"[0-9a-f]{64}", str(policy.get("script_sha256") or "")) is not None
+        and deployment_receipt.is_absolute()
+        and ".." not in deployment_receipt.parts
+        and script.is_absolute()
+        and ".." not in script.parts
+        and script.suffix.lower() in {".py", ".sh", ".bash"}
+        and re.fullmatch(r"[0-9a-f]{12}", str(job.get("id") or "")) is not None
     )
 
 
@@ -4793,6 +4863,17 @@ def _run_job_script(
             return False, "Blocked: protected script execution requires /proc/self/fd"
         execution_path = str(proc_fd_root / str(protected_script_descriptor))
 
+    if outcome_run_id is not None and (
+        protected_script_descriptor is None
+        or not isinstance(job, dict)
+        or not _job_outcome_capability_eligible(job)
+        or _BUILTIN_PROVIDER_DISPATCH.get() is not _BUILTIN_PROVIDER_SENTINEL
+        or not _is_gateway_main_process()
+    ):
+        if protected_script_descriptor is not None:
+            os.close(protected_script_descriptor)
+        return False, "Blocked: scheduler outcome capability provenance is invalid"
+
     script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
@@ -4866,8 +4947,21 @@ def _run_job_script(
                 "encoding": "utf-8",
                 "errors": "replace",
             }
-        env = build_subprocess_env()
-        env.update(env_overlay)
+        if protected_script_descriptor is not None:
+            # Protected scripts receive a deliberately tiny environment. Do
+            # not let user dotenv/PATH, dynamic-loader, shell-startup, or
+            # Python-import variables execute code before the validated inode.
+            env = {
+                "HOME": "/var/empty",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PATH": "/usr/bin:/bin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONNOUSERSITE": "1",
+            }
+        else:
+            env = build_subprocess_env()
+            env.update(env_overlay)
         # Never trust a capability inherited from the gateway or caller. Only
         # the built-in ticker's per-dispatch argument may enter the child.
         env.pop(_OUTCOME_RUN_ID_ENV, None)
@@ -7667,7 +7761,17 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
-        _outcome_run_id = _OUTCOME_RUN_CAPABILITY.get()
+        candidate_outcome_run_id = _OUTCOME_RUN_CAPABILITY.get()
+        _outcome_run_id = (
+            candidate_outcome_run_id
+            if (
+                candidate_outcome_run_id is not None
+                and _job_outcome_capability_eligible(job)
+                and _BUILTIN_PROVIDER_DISPATCH.get() is _BUILTIN_PROVIDER_SENTINEL
+                and _is_gateway_main_process()
+            )
+            else None
+        )
         _effective_extra_prompt = extra_prompt
         _outcome_receipt_not_before = time.time()
         try:
@@ -8393,6 +8497,7 @@ def tick(
                 uuid.uuid4().hex
                 if (
                     _job_outcome_capability_eligible(claimed_job)
+                    and _BUILTIN_PROVIDER_DISPATCH.get() is _BUILTIN_PROVIDER_SENTINEL
                     and _is_gateway_main_process()
                 )
                 else None
