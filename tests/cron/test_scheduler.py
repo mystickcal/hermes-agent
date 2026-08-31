@@ -25,6 +25,7 @@ from cron.scheduler import (
     _summarize_cron_failure_for_delivery,
     _authorize_external_job_script,
     _is_gateway_main_process,
+    _job_outcome_capability_eligible,
     _read_root_owned_immutable_file,
     _run_job_script,
     _validate_outcome_receipt,
@@ -35,6 +36,21 @@ from tools.credential_files import clear_credential_files
 
 
 class TestOutcomeReceiptGate:
+    def test_mutable_or_incomplete_job_is_not_capability_eligible(self):
+        assert _job_outcome_capability_eligible({
+            "id": "abc123def456",
+            "no_agent": True,
+            "script": "mutable.py",
+            "outcome_receipt_path": "/tmp/outcome.json",
+            "outcome_receipt_workflow": "workflow",
+            "script_custody": {
+                "schema": "aime.hermes-protected-script.v1",
+                "automation_id": "A170",
+                "script_sha256": "not-a-hash",
+                "deployment_receipt": "relative.json",
+            },
+        }) is False
+
     def test_missing_receipt_fails_closed(self, tmp_path):
         error = _validate_outcome_receipt(
             {"outcome_receipt_path": str(tmp_path / "missing.json")}, 100.0
@@ -165,13 +181,26 @@ class TestOutcomeReceiptGate:
             "app.slice/hermes-gateway.service\n"
         )
         status = "Name:\thermes\nNSpid:\t2294\t2\n"
-        procs = "2294\n2500\n2600\n"
+        systemctl_metadata = SimpleNamespace(st_mode=stat_module.S_IFREG | 0o755, st_uid=0)
+        runtime_metadata = SimpleNamespace(st_mode=stat_module.S_IFDIR | 0o700, st_uid=1000)
+        bus_metadata = SimpleNamespace(st_mode=stat_module.S_IFSOCK | 0o600, st_uid=1000)
+        result = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "MainPID=2294\nActiveState=active\nSubState=running\n"
+                "ControlGroup=/user.slice/user-1000.slice/user@1000.service/"
+                "app.slice/hermes-gateway.service\n"
+            ),
+        )
 
         with patch("cron.scheduler.os.getuid", return_value=1000), \
              patch("cron.scheduler.Path.read_text", side_effect=[
-                 cgroup, status, procs, status, cgroup, procs,
+                 cgroup, status, status, cgroup,
              ]), \
-             patch("cron.scheduler.Path.resolve", autospec=True, side_effect=lambda self, strict: self):
+             patch("cron.scheduler.Path.lstat", side_effect=[
+                 systemctl_metadata, runtime_metadata, bus_metadata,
+             ]), \
+             patch("cron.scheduler.subprocess.run", side_effect=[result, result]):
             assert _is_gateway_main_process() is True
 
     def test_gateway_child_cannot_attest_as_main_process(self):
@@ -180,13 +209,26 @@ class TestOutcomeReceiptGate:
             "app.slice/hermes-gateway.service\n"
         )
         status = "Name:\tchild\nNSpid:\t2500\t3\n"
-        procs = "2294\n2500\n2600\n"
+        systemctl_metadata = SimpleNamespace(st_mode=stat_module.S_IFREG | 0o755, st_uid=0)
+        runtime_metadata = SimpleNamespace(st_mode=stat_module.S_IFDIR | 0o700, st_uid=1000)
+        bus_metadata = SimpleNamespace(st_mode=stat_module.S_IFSOCK | 0o600, st_uid=1000)
+        result = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "MainPID=2294\nActiveState=active\nSubState=running\n"
+                "ControlGroup=/user.slice/user-1000.slice/user@1000.service/"
+                "app.slice/hermes-gateway.service\n"
+            ),
+        )
 
         with patch("cron.scheduler.os.getuid", return_value=1000), \
              patch("cron.scheduler.Path.read_text", side_effect=[
-                 cgroup, status, procs, status, cgroup, procs,
+                 cgroup, status, status, cgroup,
              ]), \
-             patch("cron.scheduler.Path.resolve", autospec=True, side_effect=lambda self, strict: self):
+             patch("cron.scheduler.Path.lstat", side_effect=[
+                 systemctl_metadata, runtime_metadata, bus_metadata,
+             ]), \
+             patch("cron.scheduler.subprocess.run", side_effect=[result, result]):
             assert _is_gateway_main_process() is False
 
 
@@ -284,6 +326,7 @@ class TestProtectedExternalScriptGate:
         receipt_raw = self._canonical(receipt)
         job = self._job(policy) | {
             "no_agent": True,
+            "script": str(self.SCRIPT_PATH),
             "outcome_receipt_path": outcome["path"],
             "outcome_receipt_workflow": outcome["workflow"],
         }
@@ -304,6 +347,7 @@ class TestProtectedExternalScriptGate:
         script, receipt, manifest, policy = self._fixture()
         job = self._job(policy) | {
             "no_agent": True,
+            "script": str(self.SCRIPT_PATH),
             "outcome_receipt_path": "/var/lib/aime-example/outcome.json",
             "outcome_receipt_workflow": "a172-youtube-upload-stuck-watchdog",
         }
@@ -497,8 +541,10 @@ class TestProtectedExternalScriptGate:
     def test_swap_after_authorization_executes_validated_inode(self, tmp_path):
         script_path = tmp_path / "protected.sh"
         replacement = tmp_path / "replacement.sh"
+        bash_env = tmp_path / "bash-env.sh"
         script_path.write_text("#!/bin/bash\nprintf 'approved\\n'\n")
         replacement.write_text("#!/bin/bash\nprintf 'swapped\\n'\n")
+        bash_env.write_text("printf 'hijacked\\n'\n")
 
         def authorize_then_swap(job, path):
             descriptor = os.open(path, os.O_RDONLY)
@@ -511,6 +557,13 @@ class TestProtectedExternalScriptGate:
         ), patch(
             "cron.scheduler._open_protected_interpreter",
             side_effect=lambda _suffix: os.open("/usr/bin/bash", os.O_RDONLY),
+        ), patch.dict(
+            os.environ,
+            {
+                "BASH_ENV": str(bash_env),
+                "LD_LIBRARY_PATH": str(tmp_path),
+                "PYTHONPATH": str(tmp_path),
+            },
         ):
             ok, output = _run_job_script(
                 str(script_path), job={"id": self.JOB_ID}
@@ -2475,8 +2528,9 @@ class TestParallelTick:
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
              patch("cron.scheduler.mark_job_run"):
-            from cron.scheduler import tick
-            assert tick(verbose=False) == 1
+            from cron.scheduler import _builtin_provider_dispatch, tick
+            with _builtin_provider_dispatch():
+                assert tick(verbose=False) == 1
 
         assert captured == ["a" * 32]
 
