@@ -72,41 +72,79 @@ _PROTECTED_SCRIPT_DEPLOYMENT_SCHEMA = "aime.hermes-protected-script-deployment.v
 _PROTECTED_SCRIPT_RELEASE_SCHEMA = "aime.hermes-protected-script-release.v1"
 _MAX_PROTECTED_TRAMPOLINE_BYTES = 1024 * 1024
 _OUTCOME_RUN_ID_ENV = "HERMES_OUTCOME_RUN_ID"
+_OUTCOME_RUN_CAPABILITY: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "cron_outcome_run_capability", default=None,
+)
 
 
 def _is_gateway_main_process() -> bool:
-    """Return true only inside the live systemd Hermes gateway process.
+    """Return true only for the leader of the live gateway's kernel cgroup.
 
-    Semantic receipt capabilities must not be minted by a CLI/manual call to
-    ``tick()``. Linux deployments therefore bind issuance to systemd's exact
-    MainPID through a fixed root-owned binary. Unsupported platforms fail
-    closed for capability-backed jobs while ordinary cron jobs are unchanged.
+    This avoids environment-sensitive D-Bus/systemctl lookups. A terminal or
+    MCP child may share the service cgroup, but only the gateway leader has the
+    smallest host PID in ``cgroup.procs``. ``NSpid`` supplies that host PID
+    even when Hermes runs inside a nested PID namespace.
     """
     if sys.platform != "linux":
         return False
-    systemctl = Path("/usr/bin/systemctl")
     try:
-        metadata = systemctl.stat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) & 0o022
-        ):
-            return False
-        result = subprocess.run(
-            [
-                str(systemctl), "--user", "show",
-                "--property=MainPID", "--value", "hermes-gateway.service",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2.0,
+        uid = os.getuid()
+        expected = (
+            f"/user.slice/user-{uid}.slice/user@{uid}.service/"
+            "app.slice/hermes-gateway.service"
         )
-        value = result.stdout.strip()
-        return result.returncode == 0 and value.isdigit() and int(value) == os.getpid()
-    except (OSError, subprocess.SubprocessError, ValueError):
+        cgroup_lines = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+        if cgroup_lines != [f"0::{expected}"]:
+            return False
+        status_before = Path("/proc/self/status").read_text(encoding="ascii")
+        nspid_lines = [line for line in status_before.splitlines() if line.startswith("NSpid:")]
+        if len(nspid_lines) != 1:
+            return False
+        pid_values = nspid_lines[0].split()[1:]
+        if not pid_values or not all(value.isdigit() for value in pid_values):
+            return False
+        host_pid = int(pid_values[0])
+        cgroup_dir = Path("/sys/fs/cgroup") / expected.lstrip("/")
+        if cgroup_dir.resolve(strict=True) != cgroup_dir:
+            return False
+        procs_path = cgroup_dir / "cgroup.procs"
+        procs_before = procs_path.read_text(encoding="ascii").split()
+        if not procs_before or not all(value.isdigit() for value in procs_before):
+            return False
+        status_after = Path("/proc/self/status").read_text(encoding="ascii")
+        cgroup_after = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+        procs_after = procs_path.read_text(encoding="ascii").split()
+        return (
+            status_before == status_after
+            and cgroup_after == cgroup_lines
+            and procs_after == procs_before
+            and host_pid == min(int(value) for value in procs_before)
+        )
+    except (OSError, UnicodeError, ValueError):
         return False
+
+
+def _job_outcome_capability_eligible(job: dict) -> bool:
+    """Require the complete protected no-agent receipt contract."""
+    path_text = str(job.get("outcome_receipt_path") or "")
+    workflow = job.get("outcome_receipt_workflow")
+    policy = job.get("script_custody")
+    try:
+        path = Path(path_text)
+    except (TypeError, ValueError):
+        return False
+    return (
+        job.get("no_agent") is True
+        and path.is_absolute()
+        and ".." not in path.parts
+        and isinstance(workflow, str)
+        and bool(workflow.strip())
+        and isinstance(policy, dict)
+        and set(policy) == {
+            "schema", "automation_id", "script_sha256", "deployment_receipt",
+        }
+        and policy.get("schema") == _PROTECTED_SCRIPT_SCHEMA
+    )
 
 
 def _validate_outcome_receipt(
@@ -123,29 +161,68 @@ def _validate_outcome_receipt(
     configured = job.get("outcome_receipt_path")
     if not configured:
         return None
+    if expected_run_id is not None and not re.fullmatch(r"[0-9a-f]{32}", expected_run_id):
+        return "required outcome receipt expected an invalid execution capability"
     path = Path(str(configured)).expanduser()
     if not path.is_absolute():
         return "outcome receipt path must be absolute"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        return "outcome receipt verification requires O_NOFOLLOW support"
+    descriptor = -1
     try:
-        stat = path.stat()
+        path_before = path.lstat()
+        if not stat.S_ISREG(path_before.st_mode) or path_before.st_nlink != 1:
+            return "required outcome receipt must be a single-linked regular file"
+        descriptor = os.open(
+            path, os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > 1024 * 1024
+            or before.st_dev != path_before.st_dev
+            or before.st_ino != path_before.st_ino
+        ):
+            return "required outcome receipt descriptor custody is invalid"
+        raw = os.read(descriptor, 1024 * 1024 + 1)
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
     except OSError as exc:
         return f"required outcome receipt is missing: {exc}"
-    if stat.st_size <= 0 or stat.st_size > 1024 * 1024:
-        return "required outcome receipt is empty or exceeds 1 MiB"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identity = lambda item: (
+        item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+    )
+    if (
+        len(raw) != before.st_size
+        or identity(before) != identity(after)
+        or before.st_dev != path_after.st_dev
+        or before.st_ino != path_after.st_ino
+    ):
+        return "required outcome receipt changed during descriptor read"
     # A stale pass from yesterday must not bless today's attempted action.
-    if stat.st_mtime + 1.0 < not_before:
+    if before.st_mtime + 1.0 < not_before:
         return "required outcome receipt is stale for this execution"
     try:
-        receipt = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        receipt = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
         return f"required outcome receipt is invalid JSON: {exc}"
     if not isinstance(receipt, dict):
         return "required outcome receipt root must be an object"
     if receipt.get("schema") != _OUTCOME_RECEIPT_SCHEMA:
         return "required outcome receipt has an unknown verifier schema"
     expected_workflow = job.get("outcome_receipt_workflow")
-    if expected_workflow and receipt.get("workflow") != expected_workflow:
+    if not isinstance(expected_workflow, str) or not expected_workflow.strip():
+        return "outcome receipt workflow must be configured"
+    if receipt.get("workflow") != expected_workflow:
         return "required outcome receipt belongs to a different workflow"
+    if receipt.get("job_id") != str(job.get("id") or ""):
+        return "required outcome receipt belongs to a different job"
     if expected_run_id is None:
         return "required outcome receipt has no scheduler-issued execution capability"
     if receipt.get("run_id") != expected_run_id:
@@ -4439,6 +4516,23 @@ def _read_root_owned_immutable_file(
     return payload
 
 
+def _open_protected_interpreter(suffix: str) -> int:
+    """Descriptor-pin the fixed root-custodied interpreter for a trampoline."""
+    configured = Path("/usr/bin/bash" if suffix in {".sh", ".bash"} else "/usr/bin/python3")
+    resolved = configured.resolve(strict=True)
+    if suffix in {".sh", ".bash"}:
+        if resolved != Path("/usr/bin/bash"):
+            raise ValueError("protected shell interpreter resolves unexpectedly")
+    elif not re.fullmatch(r"/usr/bin/python3(?:\.[0-9]+)?", str(resolved)):
+        raise ValueError("protected Python interpreter resolves unexpectedly")
+    descriptor, _ = _open_root_owned_immutable_file(
+        resolved,
+        label="protected script interpreter",
+        max_bytes=64 * 1024 * 1024,
+    )
+    return descriptor
+
+
 def _authorize_external_job_script(
     job: Optional[dict], path: Path,
 ) -> tuple[Optional[int], Optional[str]]:
@@ -4525,9 +4619,25 @@ def _authorize_external_job_script(
         "path": str(path),
         "sha256": script_sha256,
     }
+    expected_outcome = None
+    if job.get("outcome_receipt_path") or job.get("outcome_receipt_workflow"):
+        if not _job_outcome_capability_eligible(job):
+            os.close(script_descriptor)
+            return None, "external script outcome capability policy is incomplete"
+        outcome_path = Path(str(job["outcome_receipt_path"]))
+        expected_outcome = {
+            "schema": _OUTCOME_RECEIPT_SCHEMA,
+            "path": str(outcome_path),
+            "workflow": str(job["outcome_receipt_workflow"]),
+            "job_id": native_job_id,
+            "mode": "no_agent",
+        }
     if receipt.get("hermes_script") != expected_binding:
         os.close(script_descriptor)
         return None, "external script deployment receipt binds a different trampoline"
+    if receipt.get("outcome_receipt") != expected_outcome:
+        os.close(script_descriptor)
+        return None, "external script deployment receipt binds a different outcome policy"
 
     release = Path(str(receipt.get("release") or ""))
     manifest_path = Path(str(receipt.get("manifest_path") or ""))
@@ -4566,6 +4676,7 @@ def _authorize_external_job_script(
         or manifest.get("native_job_id") != native_job_id
         or manifest.get("release") != str(release)
         or manifest.get("hermes_script") != expected_binding
+        or manifest.get("outcome_receipt") != expected_outcome
     ):
         os.close(script_descriptor)
         return None, "external script release manifest binds a different release"
@@ -4577,7 +4688,6 @@ def _run_job_script(
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
     job: Optional[dict] = None,
-    outcome_run_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4613,10 +4723,6 @@ def _run_job_script(
             (#69396).
         job: Full cron job record. Required only for a protected external
             trampoline; ordinary scripts retain the existing behavior.
-        outcome_run_id: Scheduler-issued per-execution capability. When
-            present, it is injected only into the child script environment.
-            Parent environment values with the same name are always removed.
-
     Returns:
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
@@ -4625,6 +4731,7 @@ def _run_job_script(
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
 
+    outcome_run_id = _OUTCOME_RUN_CAPABILITY.get()
     if outcome_run_id is not None and not re.fullmatch(r"[0-9a-f]{32}", outcome_run_id):
         return False, "Blocked: invalid scheduler-issued outcome execution capability"
 
@@ -4656,6 +4763,7 @@ def _run_job_script(
         path = (scripts_dir / raw).resolve()
 
     protected_script_descriptor: Optional[int] = None
+    protected_interpreter_descriptor: Optional[int] = None
     # Guard against path traversal, absolute path injection, and symlink
     # escape — scripts MUST reside within HERMES_HOME/scripts/.
     try:
@@ -4698,9 +4806,17 @@ def _run_job_script(
         # shutil.which returns None — fall back to a clear error rather
         # than a FileNotFoundError with a confusing "[WinError 2]"
         # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        if protected_script_descriptor is not None:
+            try:
+                protected_interpreter_descriptor = _open_protected_interpreter(suffix)
+            except (OSError, ValueError, RuntimeError) as exc:
+                os.close(protected_script_descriptor)
+                return False, f"Blocked: protected interpreter custody failed: {exc}"
+            _bash = f"/proc/self/fd/{protected_interpreter_descriptor}"
+        else:
+            _bash = shutil.which("bash") or (
+                "/bin/bash" if os.path.isfile("/bin/bash") else None
+            )
         if _bash is None:
             if protected_script_descriptor is not None:
                 os.close(protected_script_descriptor)
@@ -4712,7 +4828,16 @@ def _run_job_script(
         argv = [_bash, execution_path]
         env_overlay: dict[str, str] = {}
     else:
-        python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
+        if protected_script_descriptor is not None:
+            try:
+                protected_interpreter_descriptor = _open_protected_interpreter(suffix)
+            except (OSError, ValueError, RuntimeError) as exc:
+                os.close(protected_script_descriptor)
+                return False, f"Blocked: protected interpreter custody failed: {exc}"
+            python_exe = f"/proc/self/fd/{protected_interpreter_descriptor}"
+            env_overlay = {}
+        else:
+            python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         if env_overlay:
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
             # editable installs importable — .pth processing needs
@@ -4727,8 +4852,13 @@ def _run_job_script(
         from tools.environments.local import build_subprocess_env
 
         popen_kwargs: dict[str, Any] = {"start_new_session": True}
-        if protected_script_descriptor is not None:
-            popen_kwargs["pass_fds"] = (protected_script_descriptor,)
+        protected_fds = tuple(
+            descriptor for descriptor in (
+                protected_script_descriptor, protected_interpreter_descriptor,
+            ) if descriptor is not None
+        )
+        if protected_fds:
+            popen_kwargs["pass_fds"] = protected_fds
         if sys.platform == "win32":
             popen_kwargs = {
                 "creationflags": windows_hide_flags()
@@ -4762,6 +4892,9 @@ def _run_job_script(
             if protected_script_descriptor is not None:
                 os.close(protected_script_descriptor)
                 protected_script_descriptor = None
+            if protected_interpreter_descriptor is not None:
+                os.close(protected_interpreter_descriptor)
+                protected_interpreter_descriptor = None
         deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -4816,6 +4949,8 @@ def _run_job_script(
     except Exception as exc:
         if protected_script_descriptor is not None:
             os.close(protected_script_descriptor)
+        if protected_interpreter_descriptor is not None:
+            os.close(protected_interpreter_descriptor)
         return False, f"Script execution failed: {exc}"
 
 
@@ -4824,7 +4959,6 @@ def _run_job_script_with_claim_heartbeat(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
-    outcome_run_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4848,7 +4982,6 @@ def _run_job_script_with_claim_heartbeat(
     ):
         return _run_job_script(
             script_path, workdir=workdir, cancel_event=cancel_event, job=job,
-            outcome_run_id=outcome_run_id,
         )
 
     job_id = str(job.get("id") or "")
@@ -4882,13 +5015,11 @@ def _run_job_script_with_claim_heartbeat(
         )
         return _run_job_script(
             script_path, workdir=workdir, cancel_event=cancel_event, job=job,
-            outcome_run_id=outcome_run_id,
         )
 
     try:
         return _run_job_script(
             script_path, workdir=workdir, cancel_event=cancel_event, job=job,
-            outcome_run_id=outcome_run_id,
         )
     finally:
         stop.set()
@@ -5781,7 +5912,6 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
-    outcome_run_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -5799,11 +5929,6 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run',
     prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
     never persisted to the job definition.
-
-    ``outcome_run_id``: an internal capability created only by the built-in
-    ticker after it has durably recorded the execution. It is passed to a
-    no-agent script through a scrubbed child environment and to agent jobs
-    through the bounded execution directive. Direct/manual callers omit it.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -5874,7 +5999,6 @@ def run_job(
         try:
             ok, output = _run_job_script_with_claim_heartbeat(
                 job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
-                outcome_run_id=outcome_run_id,
             )
         except Exception as exc:
             logger.exception(
@@ -7390,7 +7514,6 @@ def run_one_job(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
-    outcome_run_id: Optional[str] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -7435,7 +7558,6 @@ def run_one_job(
                     else lost_ownership
                 ),
                 execution_token=execution_token,
-                outcome_run_id=outcome_run_id,
             ),
         )
     finally:
@@ -7456,7 +7578,6 @@ def _run_one_job_body(
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
-    outcome_run_id: Optional[str] = None,
 ) -> bool:
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
@@ -7546,21 +7667,8 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
-        _outcome_run_id = outcome_run_id
+        _outcome_run_id = _OUTCOME_RUN_CAPABILITY.get()
         _effective_extra_prompt = extra_prompt
-        if job.get("outcome_receipt_path"):
-            if _outcome_run_id is not None:
-                _outcome_directive = (
-                    "\n\n[HERMES_OUTCOME_EXECUTION_V1]\n"
-                    f"This execution's outcome run ID is `{_outcome_run_id}`. "
-                    "Pass it to the canonical outcome verifier as "
-                    f"`--run-id {_outcome_run_id}`. The scheduler rejects a "
-                    "receipt for any other execution.\n"
-                    "[/HERMES_OUTCOME_EXECUTION_V1]"
-                )
-                _effective_extra_prompt = (
-                    f"{extra_prompt or ''}{_outcome_directive}"
-                )
         _outcome_receipt_not_before = time.time()
         try:
             if fire_claim_lost is None:
@@ -7568,7 +7676,6 @@ def _run_one_job_body(
                     job,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=_effective_extra_prompt,
-                    outcome_run_id=_outcome_run_id,
                 )
             else:
                 success, output, final_response, error = run_job(
@@ -7576,7 +7683,6 @@ def _run_one_job_body(
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=_effective_extra_prompt,
                     cancel_event=fire_claim_lost,
-                    outcome_run_id=_outcome_run_id,
                 )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -8286,18 +8392,21 @@ def tick(
             outcome_run_id = (
                 uuid.uuid4().hex
                 if (
-                    claimed_job.get("outcome_receipt_path")
+                    _job_outcome_capability_eligible(claimed_job)
                     and _is_gateway_main_process()
                 )
                 else None
             )
-            return run_one_job(
-                claimed_job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                outcome_run_id=outcome_run_id,
-            )
+            capability_token = _OUTCOME_RUN_CAPABILITY.set(outcome_run_id)
+            try:
+                return run_one_job(
+                    claimed_job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                )
+            finally:
+                _OUTCOME_RUN_CAPABILITY.reset(capability_token)
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
