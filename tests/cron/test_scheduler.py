@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import stat as stat_module
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -196,6 +197,41 @@ class TestOutcomeReceiptGate:
         with patch("cron.scheduler.os.getuid", return_value=1000), \
              patch("cron.scheduler.Path.read_text", side_effect=[
                  cgroup, status, status, cgroup,
+             ]), \
+             patch("cron.scheduler.Path.lstat", side_effect=[
+                 systemctl_metadata, runtime_metadata, bus_metadata,
+             ]), \
+             patch("cron.scheduler.subprocess.run", side_effect=[result, result]):
+            assert _is_gateway_main_process() is True
+
+    def test_gateway_identity_ignores_volatile_status_counters(self):
+        cgroup = (
+            "0::/user.slice/user-1000.slice/user@1000.service/"
+            "app.slice/hermes-gateway.service\n"
+        )
+        status_before = (
+            "Name:\thermes\nVmRSS:\t1000 kB\nNSpid:\t2294\t2\n"
+            "voluntary_ctxt_switches:\t10\n"
+        )
+        status_after = (
+            "Name:\thermes\nVmRSS:\t1400 kB\nNSpid:\t2294\t2\n"
+            "voluntary_ctxt_switches:\t19\n"
+        )
+        systemctl_metadata = SimpleNamespace(st_mode=stat_module.S_IFREG | 0o755, st_uid=0)
+        runtime_metadata = SimpleNamespace(st_mode=stat_module.S_IFDIR | 0o700, st_uid=1000)
+        bus_metadata = SimpleNamespace(st_mode=stat_module.S_IFSOCK | 0o600, st_uid=1000)
+        result = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "MainPID=2294\nActiveState=active\nSubState=running\n"
+                "ControlGroup=/user.slice/user-1000.slice/user@1000.service/"
+                "app.slice/hermes-gateway.service\n"
+            ),
+        )
+
+        with patch("cron.scheduler.os.getuid", return_value=1000), \
+             patch("cron.scheduler.Path.read_text", side_effect=[
+                 cgroup, status_before, status_after, cgroup,
              ]), \
              patch("cron.scheduler.Path.lstat", side_effect=[
                  systemctl_metadata, runtime_metadata, bus_metadata,
@@ -572,6 +608,53 @@ class TestProtectedExternalScriptGate:
         assert ok is True
         assert output == "approved"
         assert "swapped" in script_path.read_text()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="PID-bound /proc FD proof is Linux-only")
+    def test_outcome_capability_uses_pid_bound_fd_not_child_environment(self, tmp_path):
+        script_path = tmp_path / "protected.sh"
+        expected_run_id = "a" * 32
+        script_path.write_text(
+            "#!/bin/bash\n"
+            "fd=${HERMES_OUTCOME_CAPABILITY_FD:?}\n"
+            "printf 'HERMES_OUTCOME_CAPABILITY_V1 %s\\n' \"$$\" >&\"$fd\"\n"
+            "IFS= read -r run_id <&\"$fd\"\n"
+            "test \"$run_id\" = '" + expected_run_id + "'\n"
+            "test -z \"${HERMES_OUTCOME_RUN_ID+x}\"\n"
+            "! grep -zq '^HERMES_OUTCOME_RUN_ID=' /proc/$$/environ\n"
+            "printf 'approved\\n'\n"
+        )
+        job = {
+            "id": self.JOB_ID,
+            "no_agent": True,
+            "script": str(script_path),
+            "outcome_receipt_path": "/var/lib/aime-example/outcome.json",
+            "outcome_receipt_workflow": "a172-youtube-upload-stuck-watchdog",
+            "script_custody": {
+                "schema": "aime.hermes-protected-script.v1",
+                "automation_id": "A172",
+                "script_sha256": "b" * 64,
+                "deployment_receipt": "/var/lib/aime-example/deployment.json",
+            },
+        }
+
+        with patch(
+            "cron.scheduler._authorize_external_job_script",
+            side_effect=lambda _job, path: (os.open(path, os.O_RDONLY), None),
+        ), patch(
+            "cron.scheduler._open_protected_interpreter",
+            side_effect=lambda _suffix: os.open("/usr/bin/bash", os.O_RDONLY),
+        ), patch(
+            "cron.scheduler._OUTCOME_RUN_CAPABILITY",
+            SimpleNamespace(get=lambda: expected_run_id),
+        ), patch(
+            "cron.scheduler._BUILTIN_PROVIDER_DISPATCH",
+            SimpleNamespace(get=lambda: __import__("cron.scheduler", fromlist=[
+                "_BUILTIN_PROVIDER_SENTINEL"
+            ])._BUILTIN_PROVIDER_SENTINEL),
+        ), patch("cron.scheduler._is_gateway_main_process", return_value=True):
+            ok, output = _run_job_script(str(script_path), job=job)
+
+        assert (ok, output) == (True, "approved")
 
     @pytest.mark.skipif(os.name == "nt", reason="root custody is Unix-only")
     def test_root_custody_reader_accepts_stable_descriptor_identity(self):
