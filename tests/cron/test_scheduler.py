@@ -101,6 +101,61 @@ class TestOutcomeReceiptGate:
             {"outcome_receipt_path": str(path)}, 100.0
         )
 
+    def test_matching_receipt_without_scheduler_capability_is_rejected(self, tmp_path):
+        path = tmp_path / "receipt.json"
+        path.write_text(json.dumps({
+            "schema": "aime.hermes-workflow-outcome.v1",
+            "workflow": "a170-youtube-gap-digest",
+            "run_id": "a" * 32,
+            "status": "pass",
+        }))
+        os.utime(path, (200.0, 200.0))
+
+        error = _validate_outcome_receipt(
+            {
+                "outcome_receipt_path": str(path),
+                "outcome_receipt_workflow": "a170-youtube-gap-digest",
+            },
+            100.0,
+            expected_run_id=None,
+        )
+
+        assert "no scheduler-issued execution capability" in error
+
+    def test_script_receives_only_explicit_scheduler_capability(self, tmp_path, monkeypatch):
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        script = scripts / "show_capability.py"
+        script.write_text(
+            "import os\nprint(os.environ.get('HERMES_OUTCOME_RUN_ID', 'missing'))\n"
+        )
+        monkeypatch.setenv("HERMES_OUTCOME_RUN_ID", "f" * 32)
+
+        with patch("cron.scheduler._get_hermes_home", return_value=tmp_path):
+            ok_missing, output_missing = _run_job_script(
+                script.name, job={}, outcome_run_id=None,
+            )
+            ok_bound, output_bound = _run_job_script(
+                script.name, job={}, outcome_run_id="a" * 32,
+            )
+
+        assert (ok_missing, output_missing) == (True, "missing")
+        assert (ok_bound, output_bound) == (True, "a" * 32)
+
+    def test_invalid_script_capability_fails_before_execution(self, tmp_path):
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        script = scripts / "must_not_run.py"
+        script.write_text("raise SystemExit('ran')\n")
+
+        with patch("cron.scheduler._get_hermes_home", return_value=tmp_path):
+            ok, error = _run_job_script(
+                script.name, job={}, outcome_run_id="not-a-capability",
+            )
+
+        assert ok is False
+        assert "invalid scheduler-issued" in error
+
 
 class TestProtectedExternalScriptGate:
     SCRIPT_PATH = Path("/usr/local/libexec/aime-example/run.sh")
@@ -1950,6 +2005,7 @@ class TestSilentDelivery:
         })
         with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler._is_gateway_main_process", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "claimed success", None)) as run_mock, \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result"), \
@@ -2297,6 +2353,59 @@ class TestParallelTick:
         assert len(starts) == 2
         assert len(ends) == 2
         assert max(starts) < min(ends), f"Jobs not concurrent: {call_order}"
+
+    def test_builtin_tick_mints_outcome_capability_only_in_gateway_main_process(self):
+        captured = []
+        job = {
+            "id": "receipt-job",
+            "name": "receipt job",
+            "deliver": "local",
+            "outcome_receipt_path": "/var/lib/aime/receipt.json",
+        }
+
+        def mock_run_job(job, **kwargs):
+            captured.append(kwargs.get("outcome_run_id"))
+            return (True, "output", "response", None)
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec-1"}), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler._is_gateway_main_process", return_value=True), \
+             patch("cron.scheduler.uuid.uuid4", return_value=SimpleNamespace(hex="a" * 32)), \
+             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            assert tick(verbose=False) == 1
+
+        assert captured == ["a" * 32]
+
+    def test_manual_process_tick_cannot_mint_outcome_capability(self):
+        captured = []
+        job = {
+            "id": "receipt-job-manual",
+            "name": "receipt job manual",
+            "deliver": "local",
+            "outcome_receipt_path": "/var/lib/aime/receipt.json",
+        }
+
+        def mock_run_job(job, **kwargs):
+            captured.append(kwargs.get("outcome_run_id"))
+            return (True, "output", "response", None)
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec-2"}), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler._is_gateway_main_process", return_value=False), \
+             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            assert tick(verbose=False) == 1
+
+        assert captured == [None]
 
     def test_parallel_jobs_isolated_contextvars(self):
         """Each job's ContextVars must be isolated — no cross-contamination."""
