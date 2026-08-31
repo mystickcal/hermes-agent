@@ -4383,10 +4383,10 @@ def _authorize_external_job_script(job: Optional[dict], path: Path) -> Optional[
     """Return a reason when an external protected trampoline is not allowed.
 
     The mutable cron record is not authority by itself.  It must bind the exact
-    trampoline and exact root-custodied deployment receipt by SHA-256, while
+    trampoline SHA-256 and exact root-custodied deployment receipt path, while
     the receipt independently binds that same path/hash to an active immutable
-    source release.  This is intentionally an exact allowlist, not an absolute
-    script escape hatch.
+    source release and manifest. This is intentionally an exact allowlist, not
+    an absolute script escape hatch.
     """
     if path.suffix.lower() not in {".py", ".sh", ".bash"}:
         return "protected external script must be a .py, .sh, or .bash trampoline"
@@ -4395,7 +4395,6 @@ def _authorize_external_job_script(job: Optional[dict], path: Path) -> Optional[
         "schema",
         "script_sha256",
         "deployment_receipt",
-        "deployment_receipt_sha256",
     }
     if not isinstance(policy, dict) or set(policy) != required_policy_keys:
         return "external script requires an exact protected script_custody policy"
@@ -4403,11 +4402,8 @@ def _authorize_external_job_script(job: Optional[dict], path: Path) -> Optional[
         return "external script custody policy has an unknown schema"
 
     script_sha256 = str(policy.get("script_sha256") or "")
-    receipt_sha256 = str(policy.get("deployment_receipt_sha256") or "")
     if not re.fullmatch(r"[0-9a-f]{64}", script_sha256):
         return "external script custody has an invalid script SHA-256"
-    if not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256):
-        return "external script custody has an invalid receipt SHA-256"
 
     try:
         receipt_path = Path(str(policy.get("deployment_receipt") or ""))
@@ -4423,8 +4419,6 @@ def _authorize_external_job_script(job: Optional[dict], path: Path) -> Optional[
 
     if hashlib.sha256(script_bytes).hexdigest() != script_sha256:
         return "external script bytes do not match the custody SHA-256"
-    if hashlib.sha256(receipt_bytes).hexdigest() != receipt_sha256:
-        return "external script deployment receipt does not match its SHA-256"
     try:
         receipt = json.loads(receipt_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
