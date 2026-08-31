@@ -16,6 +16,9 @@ import pytest
 
 from cron.scheduler import (
     SILENT_MARKER,
+    _BUILTIN_PROVIDER_SENTINEL,
+    _OUTCOME_RUN_CAPABILITY,
+    _builtin_provider_dispatch,
     _build_job_prompt,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
@@ -25,12 +28,17 @@ from cron.scheduler import (
     _send_media_via_adapter,
     _summarize_cron_failure_for_delivery,
     _authorize_external_job_script,
+    _authorize_post_agent_finalizer,
     _is_gateway_main_process,
     _job_outcome_capability_eligible,
+    _job_post_agent_outcome_eligible,
     _read_root_owned_immutable_file,
     _run_job_script,
+    _run_post_agent_finalizer,
     _validate_outcome_receipt,
+    _validate_post_agent_outcome_receipt,
     run_job,
+    tick,
 )
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
@@ -266,6 +274,259 @@ class TestOutcomeReceiptGate:
              ]), \
              patch("cron.scheduler.subprocess.run", side_effect=[result, result]):
             assert _is_gateway_main_process() is False
+
+
+class TestPostAgentOutcomeGate:
+    FINALIZER = Path("/usr/local/libexec/aime-post-agent/finalize.py")
+    DEPLOYMENT = Path("/var/lib/aime-post-agent/deployment.json")
+    RECEIPT = Path("/var/lib/aime-post-agent/outcome.json")
+    RELEASE = Path("/usr/local/libexec/aime-post-agent/releases") / ("a" * 40)
+    JOB_ID = "abc123def456"
+    AUTOMATION_ID = "A143"
+    WORKFLOW = "a143-post-agent-verification"
+
+    @staticmethod
+    def _canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    @classmethod
+    def _fixture(cls):
+        finalizer = b"#!/usr/bin/python3\nraise SystemExit(0)\n"
+        finalizer_hash = hashlib.sha256(finalizer).hexdigest()
+        policy = {
+            "schema": "aime.hermes-post-agent-outcome.v1",
+            "automation_id": cls.AUTOMATION_ID,
+            "finalizer_path": str(cls.FINALIZER),
+            "finalizer_sha256": finalizer_hash,
+            "deployment_receipt": str(cls.DEPLOYMENT),
+            "receipt_path": str(cls.RECEIPT),
+            "workflow": cls.WORKFLOW,
+        }
+        finalizer_binding = {
+            "schema": "aime.hermes-protected-script.v1",
+            "path": str(cls.FINALIZER),
+            "sha256": finalizer_hash,
+        }
+        outcome_binding = {
+            "schema": "aime.hermes-post-agent-outcome-receipt.v1",
+            "path": str(cls.RECEIPT),
+            "workflow": cls.WORKFLOW,
+            "job_id": cls.JOB_ID,
+            "mode": "post_agent",
+            "response_binding": "sha256",
+        }
+        manifest = cls._canonical({
+            "schema": "aime.hermes-protected-script-release.v1",
+            "source_commit": "a" * 40,
+            "automation_id": cls.AUTOMATION_ID,
+            "native_job_id": cls.JOB_ID,
+            "release": str(cls.RELEASE),
+            "hermes_script": finalizer_binding,
+            "outcome_receipt": outcome_binding,
+        })
+        deployment = cls._canonical({
+            "schema": "aime.hermes-protected-script-deployment.v1",
+            "status": "active",
+            "source_commit": "a" * 40,
+            "automation_id": cls.AUTOMATION_ID,
+            "native_job_id": cls.JOB_ID,
+            "release": str(cls.RELEASE),
+            "manifest_path": str(cls.RELEASE / "release.json"),
+            "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+            "hermes_script": finalizer_binding,
+            "outcome_receipt": outcome_binding,
+        })
+        return finalizer, deployment, manifest, policy
+
+    @classmethod
+    def _job(cls, policy=None):
+        if policy is None:
+            policy = cls._fixture()[3]
+        return {"id": cls.JOB_ID, "post_agent_outcome": policy}
+
+    def test_complete_agent_policy_is_eligible_but_no_agent_is_not(self):
+        job = self._job()
+        assert _job_post_agent_outcome_eligible(job) is True
+        job["no_agent"] = True
+        assert _job_post_agent_outcome_eligible(job) is False
+
+    def test_finalizer_requires_reciprocal_deployment_and_manifest_binding(self):
+        finalizer, deployment, manifest, policy = self._fixture()
+        with patch.object(Path, "resolve", return_value=self.FINALIZER), patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, finalizer),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[deployment, manifest],
+        ), patch("os.close"):
+            descriptor, path, error = _authorize_post_agent_finalizer(self._job(policy))
+
+        assert (descriptor, path, error) == (29, self.FINALIZER, None)
+
+    @pytest.mark.parametrize(
+        ("target", "field", "value", "expected"),
+        [
+            ("deployment", "native_job_id", "ffffffffffff", "different job"),
+            ("deployment", "automation_id", "A149", "different job"),
+            ("deployment_script", "path", "/usr/local/libexec/foreign.py", "different trampoline"),
+            ("deployment_outcome", "workflow", "foreign", "different outcome policy"),
+            ("manifest", "native_job_id", "ffffffffffff", "different release"),
+            ("manifest_script", "path", "/usr/local/libexec/foreign.py", "different release"),
+            ("manifest_outcome", "workflow", "foreign", "different release"),
+            ("manifest", "schema", "foreign", "different release"),
+        ],
+    )
+    def test_foreign_finalizer_release_bindings_are_rejected(
+        self, target, field, value, expected,
+    ):
+        finalizer, deployment_raw, manifest_raw, policy = self._fixture()
+        deployment = json.loads(deployment_raw)
+        manifest = json.loads(manifest_raw)
+        if target == "deployment":
+            deployment[field] = value
+        elif target == "deployment_script":
+            deployment["hermes_script"][field] = value
+        elif target == "deployment_outcome":
+            deployment["outcome_receipt"][field] = value
+        elif target == "manifest":
+            manifest[field] = value
+        elif target == "manifest_script":
+            manifest["hermes_script"][field] = value
+        else:
+            manifest["outcome_receipt"][field] = value
+        manifest_raw = self._canonical(manifest)
+        deployment["manifest_sha256"] = hashlib.sha256(manifest_raw).hexdigest()
+        deployment_raw = self._canonical(deployment)
+
+        with patch.object(Path, "resolve", return_value=self.FINALIZER), patch(
+            "cron.scheduler._open_root_owned_immutable_file",
+            return_value=(29, finalizer),
+        ), patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[deployment_raw, manifest_raw],
+        ), patch("os.close"):
+            _, _, error = _authorize_post_agent_finalizer(self._job(policy))
+
+        assert expected in error
+
+    def test_receipt_rejects_response_byte_mismatch_and_foreign_identity(self, tmp_path):
+        receipt_path = tmp_path / "outcome.json"
+        policy = self._fixture()[3] | {"receipt_path": str(receipt_path)}
+        job = self._job(policy)
+        receipt_path.write_text(json.dumps({
+            "schema": "aime.hermes-post-agent-outcome-receipt.v1",
+            "status": "pass",
+            "automation_id": self.AUTOMATION_ID,
+            "job_id": self.JOB_ID,
+            "workflow": self.WORKFLOW,
+            "run_id": "b" * 32,
+            "response_sha256": hashlib.sha256(b"different").hexdigest(),
+        }))
+
+        error = _validate_post_agent_outcome_receipt(
+            job,
+            not_before=0.0,
+            run_id="b" * 32,
+            response_sha256=hashlib.sha256(b"exact").hexdigest(),
+        )
+        assert "exact execution response" in error
+
+        receipt = json.loads(receipt_path.read_text())
+        receipt["response_sha256"] = hashlib.sha256(b"exact").hexdigest()
+        receipt["automation_id"] = "A149"
+        receipt_path.write_text(json.dumps(receipt))
+        error = _validate_post_agent_outcome_receipt(
+            job,
+            not_before=0.0,
+            run_id="b" * 32,
+            response_sha256=hashlib.sha256(b"exact").hexdigest(),
+        )
+        assert "exact execution response" in error
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="PID-bound /proc FD proof is Linux-only")
+    def test_finalizer_receives_exact_bytes_and_hidden_capability_with_fd_cleanup(self, tmp_path):
+        receipt_path = tmp_path / "outcome.json"
+        finalizer_path = tmp_path / "finalize.py"
+        response = b"[SILENT]\nexact-response"
+        run_id = "c" * 32
+        finalizer_path.write_text(
+            "import hashlib, json, os\n"
+            "fd = int(os.environ['HERMES_POST_AGENT_FINALIZER_FD'])\n"
+            "sock = os.fdopen(fd, 'r+b', buffering=0)\n"
+            "sock.write(f'HERMES_POST_AGENT_FINALIZER_V1 {os.getpid()}\\n'.encode())\n"
+            "run_id = sock.readline().strip().decode('ascii')\n"
+            "size = int(sock.readline().strip())\n"
+            "payload = sock.read(size)\n"
+            "assert len(payload) == size\n"
+            "assert 'HERMES_OUTCOME_RUN_ID' not in os.environ\n"
+            "assert payload not in open('/proc/self/cmdline', 'rb').read()\n"
+            "assert payload not in open('/proc/self/environ', 'rb').read()\n"
+            f"receipt = {{'schema':'aime.hermes-post-agent-outcome-receipt.v1','status':'pass','automation_id':'{self.AUTOMATION_ID}','job_id':'{self.JOB_ID}','workflow':'{self.WORKFLOW}','run_id':run_id,'response_sha256':hashlib.sha256(payload).hexdigest()}}\n"
+            f"open({str(receipt_path)!r}, 'w').write(json.dumps(receipt))\n"
+        )
+        policy = self._fixture()[3] | {
+            "finalizer_path": str(finalizer_path),
+            "receipt_path": str(receipt_path),
+        }
+        job = self._job(policy)
+        opened = []
+
+        def authorize(_job):
+            descriptor = os.open(finalizer_path, os.O_RDONLY)
+            opened.append(descriptor)
+            return descriptor, finalizer_path, None
+
+        def interpreter(_suffix):
+            descriptor = os.open("/usr/bin/python3", os.O_RDONLY)
+            opened.append(descriptor)
+            return descriptor
+
+        with patch("cron.scheduler._authorize_post_agent_finalizer", side_effect=authorize), patch(
+            "cron.scheduler._open_protected_interpreter", side_effect=interpreter,
+        ), patch("cron.scheduler._is_gateway_main_process", return_value=True), patch(
+            "cron.scheduler._BUILTIN_PROVIDER_DISPATCH",
+            SimpleNamespace(get=lambda: _BUILTIN_PROVIDER_SENTINEL),
+        ):
+            error = _run_post_agent_finalizer(
+                job, response, run_id=run_id, not_before=0.0,
+            )
+
+        assert error is None
+        for descriptor in opened:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="PID-bound /proc FD proof is Linux-only")
+    def test_finalizer_nonzero_exit_fails_closed(self, tmp_path):
+        finalizer_path = tmp_path / "fail.py"
+        finalizer_path.write_text(
+            "import os\n"
+            "fd = int(os.environ['HERMES_POST_AGENT_FINALIZER_FD'])\n"
+            "sock = os.fdopen(fd, 'r+b', buffering=0)\n"
+            "sock.write(f'HERMES_POST_AGENT_FINALIZER_V1 {os.getpid()}\\n'.encode())\n"
+            "sock.readline(); size = int(sock.readline()); sock.read(size)\n"
+            "raise SystemExit(7)\n"
+        )
+        policy = self._fixture()[3] | {
+            "finalizer_path": str(finalizer_path),
+            "receipt_path": str(tmp_path / "missing.json"),
+        }
+        job = self._job(policy)
+        with patch(
+            "cron.scheduler._authorize_post_agent_finalizer",
+            side_effect=lambda _job: (os.open(finalizer_path, os.O_RDONLY), finalizer_path, None),
+        ), patch(
+            "cron.scheduler._open_protected_interpreter",
+            side_effect=lambda _suffix: os.open("/usr/bin/python3", os.O_RDONLY),
+        ), patch("cron.scheduler._is_gateway_main_process", return_value=True), patch(
+            "cron.scheduler._BUILTIN_PROVIDER_DISPATCH",
+            SimpleNamespace(get=lambda: _BUILTIN_PROVIDER_SENTINEL),
+        ):
+            error = _run_post_agent_finalizer(
+                job, b"response", run_id="d" * 32, not_before=0.0,
+            )
+
+        assert "failed with code 7" in error
 
 
 class TestProtectedExternalScriptGate:
@@ -2652,6 +2913,77 @@ class TestParallelTick:
             assert tick(verbose=False) == 1
 
         assert captured == [None]
+
+    def test_post_agent_tick_hides_capability_and_validates_exact_silent_bytes(self):
+        job = {
+            "id": TestPostAgentOutcomeGate.JOB_ID,
+            "name": "protected agent outcome",
+            "deliver": "local",
+            "post_agent_outcome": TestPostAgentOutcomeGate._fixture()[3],
+        }
+        agent_seen = []
+        finalized = []
+
+        def mock_run_job(_job, **_kwargs):
+            agent_seen.append(_OUTCOME_RUN_CAPABILITY.get())
+            return True, "output", "[SILENT]", None
+
+        def mock_finalizer(_job, response_bytes, *, run_id, not_before):
+            finalized.append((response_bytes, run_id, isinstance(not_before, float)))
+            return None
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), patch(
+            "cron.scheduler.create_execution", return_value={"id": "exec-post"},
+        ), patch("cron.scheduler.claim_job_for_fire", return_value=True), patch(
+            "cron.scheduler.claim_dispatch", return_value=True,
+        ), patch("cron.scheduler.mark_execution_running"), patch(
+            "cron.scheduler.finish_execution"
+        ), patch(
+            "cron.scheduler._is_gateway_main_process", return_value=True,
+        ), patch(
+            "cron.scheduler.uuid.uuid4", return_value=SimpleNamespace(hex="e" * 32),
+        ), patch("cron.scheduler.run_job", side_effect=mock_run_job), patch(
+            "cron.scheduler._run_post_agent_finalizer", side_effect=mock_finalizer,
+        ), patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), patch(
+            "cron.scheduler._deliver_result"
+        ) as deliver_mock, patch("cron.scheduler.mark_job_run") as mark_mock:
+            with _builtin_provider_dispatch():
+                assert tick(verbose=False) == 1
+
+        assert agent_seen == [None]
+        assert finalized == [(b"[SILENT]", "e" * 32, True)]
+        deliver_mock.assert_not_called()
+        assert mark_mock.call_args.args[:2] == (job["id"], True)
+
+    def test_direct_post_agent_tick_cannot_mint_or_finalize(self):
+        job = {
+            "id": TestPostAgentOutcomeGate.JOB_ID,
+            "name": "protected agent outcome manual",
+            "deliver": "local",
+            "post_agent_outcome": TestPostAgentOutcomeGate._fixture()[3],
+        }
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), patch(
+            "cron.scheduler.create_execution", return_value={"id": "exec-manual-post"},
+        ), patch("cron.scheduler.claim_job_for_fire", return_value=True), patch(
+            "cron.scheduler.claim_dispatch", return_value=True,
+        ), patch("cron.scheduler.mark_execution_running"), patch(
+            "cron.scheduler.finish_execution"
+        ), patch(
+            "cron.scheduler._is_gateway_main_process", return_value=False,
+        ), patch("cron.scheduler.run_job") as run_mock, patch(
+            "cron.scheduler._run_post_agent_finalizer"
+        ) as finalizer_mock, patch(
+            "cron.scheduler.save_job_output", return_value="/tmp/out.md"
+        ), patch("cron.scheduler._deliver_result", return_value=None), patch(
+            "cron.scheduler.mark_job_run"
+        ) as mark_mock:
+            assert tick(verbose=False) == 0
+
+        run_mock.assert_not_called()
+        finalizer_mock.assert_not_called()
+        marked = mark_mock.call_args.args
+        assert marked[1] is False
+        assert "capability provenance is invalid" in marked[2]
 
     def test_parallel_jobs_isolated_contextvars(self):
         """Each job's ContextVars must be isolated — no cross-contamination."""
