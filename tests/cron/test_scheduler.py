@@ -1,10 +1,14 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
 import contextlib
+import hashlib
 import itertools
 import json
 import logging
 import os
+from pathlib import Path
+import stat as stat_module
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -19,6 +23,9 @@ from cron.scheduler import (
     _resolve_origin,
     _send_media_via_adapter,
     _summarize_cron_failure_for_delivery,
+    _authorize_external_job_script,
+    _read_root_owned_immutable_file,
+    _run_job_script,
     _validate_outcome_receipt,
     run_job,
 )
@@ -93,6 +100,147 @@ class TestOutcomeReceiptGate:
         assert "unknown verifier schema" in _validate_outcome_receipt(
             {"outcome_receipt_path": str(path)}, 100.0
         )
+
+
+class TestProtectedExternalScriptGate:
+    SCRIPT_PATH = Path("/usr/local/libexec/aime-example/run.sh")
+    RECEIPT_PATH = Path("/var/lib/aime-example/deployment.json")
+
+    @staticmethod
+    def _fixture():
+        script = b"#!/bin/bash\nprintf 'ok\\n'\n"
+        script_sha = hashlib.sha256(script).hexdigest()
+        receipt = json.dumps(
+            {
+                "schema": "aime.example.deployment.v1",
+                "status": "active",
+                "source_commit": "a" * 40,
+                "manifest_sha256": "b" * 64,
+                "hermes_script": {
+                    "schema": "aime.hermes-protected-script.v1",
+                    "path": str(TestProtectedExternalScriptGate.SCRIPT_PATH),
+                    "sha256": script_sha,
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        policy = {
+            "schema": "aime.hermes-protected-script.v1",
+            "script_sha256": script_sha,
+            "deployment_receipt": str(TestProtectedExternalScriptGate.RECEIPT_PATH),
+            "deployment_receipt_sha256": hashlib.sha256(receipt).hexdigest(),
+        }
+        return script, receipt, policy
+
+    def test_generic_absolute_script_escape_is_rejected(self):
+        ok, error = _run_job_script(str(self.SCRIPT_PATH), job={})
+
+        assert ok is False
+        assert "exact protected script_custody policy" in error
+
+    def test_exact_script_and_deployment_receipt_binding_is_accepted(self):
+        script, receipt, policy = self._fixture()
+
+        with patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[script, receipt],
+        ):
+            error = _authorize_external_job_script(
+                {"script_custody": policy}, self.SCRIPT_PATH
+            )
+
+        assert error is None
+
+    def test_receipt_binding_to_another_path_is_rejected(self):
+        script, receipt, policy = self._fixture()
+        parsed = json.loads(receipt)
+        parsed["hermes_script"]["path"] = "/usr/local/libexec/other/run.sh"
+        receipt = json.dumps(
+            parsed, sort_keys=True, separators=(",", ":")
+        ).encode()
+        policy["deployment_receipt_sha256"] = hashlib.sha256(receipt).hexdigest()
+
+        with patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[script, receipt],
+        ):
+            error = _authorize_external_job_script(
+                {"script_custody": policy}, self.SCRIPT_PATH
+            )
+
+        assert "different trampoline" in error
+
+    def test_receipt_hash_drift_is_rejected(self):
+        script, receipt, policy = self._fixture()
+        policy["deployment_receipt_sha256"] = "0" * 64
+
+        with patch(
+            "cron.scheduler._read_root_owned_immutable_file",
+            side_effect=[script, receipt],
+        ):
+            error = _authorize_external_job_script(
+                {"script_custody": policy}, self.SCRIPT_PATH
+            )
+
+        assert "receipt does not match" in error
+
+    @pytest.mark.skipif(os.name == "nt", reason="root custody is Unix-only")
+    def test_root_custody_reader_accepts_stable_descriptor_identity(self):
+        payload = b"#!/bin/bash\nprintf 'ok\\n'\n"
+        directory = SimpleNamespace(st_mode=stat_module.S_IFDIR | 0o755, st_uid=0)
+        regular = SimpleNamespace(
+            st_mode=stat_module.S_IFREG | 0o444,
+            st_uid=0,
+            st_nlink=1,
+            st_size=len(payload),
+            st_dev=7,
+            st_ino=11,
+            st_mtime_ns=13,
+            st_ctime_ns=17,
+        )
+        path = Path("/usr/local/libexec/aime-example/run.sh")
+
+        with patch.object(
+            Path,
+            "lstat",
+            side_effect=[directory, directory, directory, directory, directory, regular, regular],
+        ), patch("os.open", return_value=23), patch(
+            "os.fstat", side_effect=[regular, regular]
+        ), patch("os.read", side_effect=[payload, b""]), patch("os.close"):
+            result = _read_root_owned_immutable_file(path, label="test fixture")
+
+        assert result == payload
+
+    @pytest.mark.skipif(os.name == "nt", reason="root custody is Unix-only")
+    def test_root_custody_reader_rejects_symlink_final_path(self):
+        directory = SimpleNamespace(st_mode=stat_module.S_IFDIR | 0o755, st_uid=0)
+        symlink = SimpleNamespace(
+            st_mode=stat_module.S_IFLNK | 0o777,
+            st_uid=0,
+            st_nlink=1,
+            st_size=9,
+        )
+
+        with patch.object(Path, "lstat", side_effect=[directory, directory, symlink]), \
+                patch("os.open") as open_file:
+            with pytest.raises(ValueError, match="root-owned and immutable"):
+                _read_root_owned_immutable_file(
+                    Path("/opt/run.sh"), label="test fixture"
+                )
+
+        open_file.assert_not_called()
+
+    @pytest.mark.skipif(os.name == "nt", reason="root custody is Unix-only")
+    def test_root_custody_reader_rejects_writable_ancestor(self):
+        root = SimpleNamespace(st_mode=stat_module.S_IFDIR | 0o755, st_uid=0)
+        writable = SimpleNamespace(st_mode=stat_module.S_IFDIR | 0o775, st_uid=0)
+
+        with patch.object(Path, "lstat", side_effect=[root, writable]):
+            with pytest.raises(ValueError, match="root-owned and immutable"):
+                _read_root_owned_immutable_file(
+                    Path("/opt/run.sh"), label="test fixture"
+                )
 
 
 class TestSummarizeCronFailureForDelivery:
