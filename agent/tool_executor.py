@@ -31,6 +31,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.continuity.replay_ledger import ledger_for_agent
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
@@ -717,7 +718,12 @@ def _dispatch_authorized_once(
     from agent.terminal_approval_batch import prepare_current_terminal
     prepare_current_terminal(ref)
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    replay_ledger = ledger_for_agent(agent, ref.task_id)
+    result, _replay_status = replay_ledger.dispatch(
+        ref.call_id, ref.name, ref.args,
+        lambda args: _run_with_activity_heartbeat(agent, ref.name, lambda: execute(args)),
+    )
+    return result
 
 
 def _run_agent_tool_execution_middleware(
