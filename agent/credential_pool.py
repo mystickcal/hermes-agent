@@ -1468,7 +1468,112 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 
     # ---- refresh -----------------------------------------------------------
 
+    def _refresh_codex_owned_entry(
+        self, entry: PooledCredential, *, force: bool = False, quota_probe: bool = False,
+    ) -> Optional[PooledCredential]:
+        """Rotate only the reread owner row; release its flock before pool mutation.
+
+        Root borrowers and the owning profile serialize on the same auth.json. Independent
+        manual rows never adopt the singleton. A peer's committed rotation wins even for a
+        forced refresh. Quota probes preserve exhaustion until /usage confirms recovery.
+        """
+        if entry.auth_type != AUTH_TYPE_OAUTH or not (
+            entry.source == "device_code" or entry.source.startswith("manual:")
+        ):
+            return None
+        principal = _codex_principal_identity(entry.access_token)
+        if principal is None:
+            return None
+        target = (_borrowed_single_use_pool_root()
+                  if entry.id in self._borrowed_root_ids else auth_mod._auth_file_path())
+        # A missing root authority must not silently fall back to a profile-local store.
+        if target is None:
+            return None
+        updated = None
+        try:
+            with _auth_store_lock(
+                timeout_seconds=self._single_use_refresh_lock_timeout(), target_path=target,
+            ):
+                store = _load_auth_store(target)
+                rows = (store.get("credential_pool") or {}).get(self.provider) or []
+                row = next((r for r in rows if isinstance(r, dict) and r.get("id") == entry.id), None)
+                if (not row or row.get("source") != entry.source
+                        or row.get("auth_type") != entry.auth_type
+                        or _codex_principal_identity(row.get("access_token")) != principal):
+                    return None
+                state = (store.get("providers") or {}).get(self.provider)
+                singleton = entry.source == "device_code"
+                authority = (state.get("tokens") if isinstance(state, dict) else None) if singleton else row
+                if (not isinstance(authority, dict)
+                        or _codex_principal_identity(authority.get("access_token")) != principal
+                        or not authority.get("refresh_token")):
+                    return None
+                stored = replace(
+                    PooledCredential.from_dict(self.provider, row),
+                    access_token=authority["access_token"], refresh_token=authority["refresh_token"],
+                    last_refresh=(state.get("last_refresh") if singleton else row.get("last_refresh")),
+                )
+                peer_rotated = (stored.access_token, stored.refresh_token) != (
+                    entry.access_token, entry.refresh_token)
+                skew = 0 if quota_probe else CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+                expiring = _codex_access_token_is_expiring(stored.access_token, skew)
+                if expiring or (force and not peer_rotated):
+                    if quota_probe:
+                        fresh = auth_mod._refresh_expired_codex_probe_token(
+                            stored.access_token, stored.refresh_token)
+                        if not fresh:
+                            return None
+                        stored = replace(stored, access_token=fresh["access_token"],
+                                         refresh_token=fresh["refresh_token"],
+                                         last_refresh=fresh.get("last_refresh"))
+                    else:
+                        stored = self._post_tokens_refresh(stored)
+                    if _codex_principal_identity(stored.access_token) != principal:
+                        return None
+                # Keep quota and model cooldown fields exactly as the authoritative row has them.
+                pair = {"access_token": stored.access_token, "refresh_token": stored.refresh_token}
+                changed = any(row.get(k) != v for k, v in pair.items())
+                if changed or stored.last_refresh != row.get("last_refresh"):
+                    row.update(pair)
+                    if stored.last_refresh:
+                        row["last_refresh"] = stored.last_refresh
+                    if singleton:
+                        authority.update(pair)
+                        if stored.last_refresh:
+                            state["last_refresh"] = stored.last_refresh
+                    _save_auth_store(store, target_path=target)
+                updated = stored
+        except Exception:
+            # Never expose an uncommitted rotated pair or run recovery with the spent input.
+            logger.debug("Codex owner-store refresh failed", exc_info=True)
+            return None
+        # Store flock is released before the pool mutex: no cross-lock inversion.
+        with self._lock:
+            current = self._find(lambda item: item.id == entry.id)
+            if (current is None or current.source != entry.source
+                    or current.auth_type != entry.auth_type
+                    or _codex_principal_identity(current.access_token) != principal):
+                return None
+            updated = replace(current, access_token=updated.access_token,
+                              refresh_token=updated.refresh_token, last_refresh=updated.last_refresh)
+            self._replace_entry(current, updated)
+        return updated
+
+    def _refresh_codex_quota_probe_tokens(self, *, model: Optional[str] = None) -> None:
+        if self.provider != "openai-codex":
+            return
+        with self._lock:
+            candidates = [entry for entry in self._entries
+                          if entry.last_status == STATUS_EXHAUSTED
+                          and auth_mod._is_codex_rate_limit_shaped(
+                              entry.last_error_code, entry.last_error_reason, entry.last_error_message)
+                          and model_cooldown_until(entry, model) is None]
+        for entry in candidates:
+            self._refresh_codex_owned_entry(entry, quota_probe=True)
+
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        if self.provider == "openai-codex":
+            return self._refresh_codex_owned_entry(entry, force=force)
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1900,20 +2005,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         if not token:
             return False
         try:
-            # An exhausted entry is skipped by the refresh chain, so its stored token is usually
-            # expired by probe time (401 -> None -> cooldown kept, #89415): refresh it first.
-            fresh = auth_mod._refresh_expired_codex_probe_token(token, entry.refresh_token)
-            if fresh:
-                # Persist the rotated pair on both sides the way ``_refresh_entry`` does:
-                # ``last_refresh`` plus the singleton write-back, or the next selection's
-                # auth-store sync re-adopts the consumed pair from ``providers.openai-codex``
-                # and clears the cooldown with it.
-                entry = self._adopt(
-                    entry, access_token=fresh["access_token"], refresh_token=fresh["refresh_token"],
-                    last_refresh=fresh.get("last_refresh") or entry.last_refresh,
-                )
-                self._sync_device_code_entry_to_auth_store(entry)
-                token = entry.access_token or token
             return bool(auth_mod._probe_codex_quota_restored(token, base_url=entry.base_url))
         except Exception:
             logger.debug("Codex quota-restored probe failed", exc_info=True)
@@ -1939,6 +2030,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     # ---- selection ---------------------------------------------------------
 
     def select(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
+        self._refresh_codex_quota_probe_tokens(model=model)
         entry, pending_refresh = self._select_under_lock(model=model)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
@@ -2138,6 +2230,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """Entry *credential_id* once its cooldown has lifted (cleared and token-refreshed the way
         ``select`` would), else ``None``. Never bumps ``request_count`` or round-robin order: a
         live session asking "may I go back?" every turn is not a request."""
+        self._refresh_codex_quota_probe_tokens(model=model)
         with self._lock:
             available, pending = self._available_entries(clear_expired=True, refresh=True, model=model)
         if any(e.id == credential_id for e in pending):
@@ -2306,6 +2399,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         every credential is at the soft cap, still return the least-leased
         one instead of blocking.
         """
+        self._refresh_codex_quota_probe_tokens()
         chosen_id, pending_refresh = self._acquire_lease_under_lock(credential_id)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)

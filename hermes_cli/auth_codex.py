@@ -784,25 +784,18 @@ def _refresh_expired_codex_probe_token(
 
 
 def _probe_codex_pool_entry_quota_restored(entry: Dict[str, Any]) -> Optional[bool]:
-    """``_probe_codex_quota_restored`` for a persisted pool entry, refreshing an expired token first."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
-    token = _stripped(entry.get("access_token"))
-    fresh = _refresh_expired_codex_probe_token(token, entry.get("refresh_token"))
-    if fresh:
-        token = fresh["access_token"]
-        try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                for disk_entry in _codex_pool_dicts(_pool_entries(auth_store, "openai-codex")):
-                    if disk_entry.get("id") == entry.get("id"):
-                        disk_entry.update(fresh)
-                        _save_auth_store(auth_store)
-                        break
-        except Exception:
-            logger.debug("Failed to persist refreshed Codex pool tokens", exc_info=True)
-    if not token:
+    """Use the pool's source-store transaction rather than rotating a stale metadata snapshot."""
+    from agent.credential_pool import load_pool, _codex_principal_identity
+    pool = load_pool("openai-codex")
+    with pool._lock:
+        current = pool._find(lambda item: item.id == entry.get("id"))
+    principal = _codex_principal_identity(entry.get("access_token"))
+    if current is None or principal is None or _codex_principal_identity(current.access_token) != principal:
         return None
-    return _probe_codex_quota_restored(token, base_url=entry.get("base_url"))
+    current = pool._refresh_codex_owned_entry(current, quota_probe=True)
+    if current is None:
+        return None
+    return _probe_codex_quota_restored(current.access_token, base_url=current.base_url)
 
 
 def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
