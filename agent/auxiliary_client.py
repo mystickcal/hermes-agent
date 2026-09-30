@@ -3966,6 +3966,16 @@ def _fallback_request_kwargs(
             requested_model=fallback_entry.get("model"), route_config=fallback_entry,
             leak_guard_config=task_config, max_tokens=max_tokens, extra_body=effective_extra_body,
         )
+    from hermes_constants import parse_reasoning_effort
+    candidate_reasoning = parse_reasoning_effort(fallback_entry.get("reasoning_effort"))
+    if candidate_reasoning is not None:
+        # Explicit destination depth beats source/task controls, including thinking-off.
+        # Leave other request metadata (and independent verbosity) intact.
+        reasoning_config = candidate_reasoning
+        fallback_extra_body = {
+            key: value for key, value in (fallback_extra_body or {}).items()
+            if str(key).strip().lower() not in _PROFILE_REASONING_KEYS - {"verbosity"}
+        }
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,

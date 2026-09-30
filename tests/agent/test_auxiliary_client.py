@@ -2382,6 +2382,108 @@ class TestKimiTemperatureOmitted:
 # ---------------------------------------------------------------------------
 
 
+class TestAuxiliaryFallbackReasoning:
+    """A fallback candidate owns its reasoning depth, even when the source disables it."""
+
+    @staticmethod
+    def _kwargs(fallback_entry, reasoning_config, extra_body, apply_fast_lane=False, model="gpt-6-luna"):
+        import agent.auxiliary_client as aux
+
+        return aux._fallback_request_kwargs(
+            aux._FallbackDestination(
+                "openai-codex", "https://chatgpt.com/backend-api/codex",
+                "codex_responses", model,
+            ),
+            task="compression",
+            messages=[{"role": "user", "content": "Summarize this conversation."}],
+            tools=None,
+            temperature=None,
+            max_tokens=512,
+            effective_timeout=120,
+            effective_extra_body=extra_body,
+            reasoning_config=reasoning_config,
+            fallback_entry={"provider": "openai-codex", "model": model, **fallback_entry},
+            task_config={},
+            apply_fast_lane=apply_fast_lane,
+        )
+
+    @pytest.mark.parametrize(
+        "inherited",
+        [{"enabled": True, "effort": "high"}, {"enabled": False}, None],
+    )
+    @pytest.mark.parametrize(
+        "source_reasoning",
+        [{"enabled": True, "effort": "high"}, {"enabled": False}],
+    )
+    @pytest.mark.parametrize("apply_fast_lane", [False, True])
+    def test_candidate_max_overrides_inherited_reasoning(self, inherited, source_reasoning, apply_fast_lane):
+        source_body = {
+            "reasoning": source_reasoning,
+            "reasoning_effort": "high",
+            "enable_thinking": False,
+            "verbosity": "low",
+            "metadata": {"source": "primary"},
+        }
+        kwargs = self._kwargs({"reasoning_effort": "max"}, inherited, source_body, apply_fast_lane)
+
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
+        assert "reasoning_effort" not in kwargs["extra_body"]
+        assert "enable_thinking" not in kwargs["extra_body"]
+        assert kwargs["extra_body"]["verbosity"] == "low"
+        assert kwargs["extra_body"]["metadata"] == {"source": "primary"}
+        assert source_body["reasoning"] is source_reasoning
+        assert source_body["reasoning_effort"] == "high"
+        assert source_body["enable_thinking"] is False
+
+    def test_candidate_sol_high_overrides_inherited_luna_max(self):
+        kwargs = self._kwargs(
+            {"reasoning_effort": "high"},
+            {"enabled": True, "effort": "max"},
+            {"reasoning": {"enabled": True, "effort": "max"}},
+            apply_fast_lane=True,
+            model="gpt-6.1-sol",
+        )
+        assert kwargs["model"] == "gpt-6.1-sol"
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "high"}
+
+    @pytest.mark.parametrize(
+        "effort, expected",
+        [
+            ("none", {"enabled": False}),
+            (False, {"enabled": False}),
+            ({"enabled": False}, {"enabled": False}),
+            ({"enabled": True, "effort": "max"}, {"enabled": True, "effort": "max"}),
+        ],
+    )
+    def test_candidate_reasoning_uses_shared_parser_controls(self, effort, expected):
+        kwargs = self._kwargs(
+            {"reasoning_effort": effort},
+            {"enabled": True, "effort": "high"},
+            {"reasoning": {"enabled": True, "effort": "high"}},
+        )
+        assert kwargs["extra_body"]["reasoning"] == expected
+
+    @pytest.mark.parametrize("entry", [{}, {"reasoning_effort": None}, {"reasoning_effort": "hgih"}])
+    @pytest.mark.parametrize("inherited", [{"enabled": True, "effort": "high"}, {"enabled": False}])
+    def test_without_valid_candidate_effort_keeps_existing_behavior(self, entry, inherited):
+        import agent.auxiliary_client as aux
+
+        source_body = {"reasoning": {"enabled": True, "effort": "low"}, "metadata": {"source": "primary"}}
+        kwargs = self._kwargs(entry, inherited, source_body)
+        expected = aux._build_call_kwargs(
+            "openai-codex", "gpt-6-luna",
+            [{"role": "user", "content": "Summarize this conversation."}],
+            temperature=None,
+            max_tokens=512,
+            timeout=120,
+            extra_body=source_body,
+            reasoning_config=inherited,
+            base_url="https://chatgpt.com/backend-api/codex",
+            task="compression",
+        )
+        assert kwargs == expected
+
+
 class TestAuxiliaryTaskExtraBody:
     def test_task_reasoning_disable_uses_deepseek_thinking_wire(self, monkeypatch):
         """Task-level ``none`` must reach an always-toggle profile as its native disable shape."""
