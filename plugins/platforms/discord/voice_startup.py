@@ -74,8 +74,8 @@ def install_speaking_hook(receiver, conn):
         if hasattr(conn, "ws") and conn.ws is not MISSING:
             conn.ws._hook = wrapped_hook
             logger.info("Speaking hook installed on live websocket")
-    except Exception as e:
-        logger.warning("Could not install hook on live ws: %s", e)
+    except Exception:
+        logger.warning("Could not install hook on live ws", exc_info=True)
 
 
 async def connect_with_receiver(channel, receiver_factory):
