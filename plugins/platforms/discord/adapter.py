@@ -730,6 +730,7 @@ class VoiceReceiver:
 
         # SSRC -> user_id mapping (populated from SPEAKING events)
         self._ssrc_to_user: Dict[int, int] = {}
+        self._speaking_hook = None
         self._lock = threading.Lock()
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: Dict[int, float] = {}
@@ -880,6 +881,8 @@ class VoiceReceiver:
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
         re-passed on each (re)connect, so wrap it on the state AND the live websocket."""
+        if self._speaking_hook is not None and conn.hook is self._speaking_hook:
+            return
         original_hook = conn.hook
         receiver_self = self
 
@@ -935,6 +938,7 @@ class VoiceReceiver:
 
         # Set on connection state (for future reconnects)
         conn.hook = wrapped_hook
+        self._speaking_hook = wrapped_hook
         try:
             from discord.utils import MISSING
             if hasattr(conn, 'ws') and conn.ws is not MISSING:
@@ -3837,7 +3841,13 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, BasePlatformAd
                 await existing.move_to(channel)
                 self._reset_voice_timeout(guild_id)
                 return True
-            vc = await channel.connect()
+            try:
+                from voice_startup import connect_with_receiver
+            except ImportError:
+                from .voice_startup import connect_with_receiver
+            vc, receiver = await connect_with_receiver(
+                channel, lambda voice: VoiceReceiver(voice, allowed_user_ids=self._allowed_user_ids)
+            )
             self._voice_clients[guild_id] = vc
             self._reset_voice_timeout(guild_id)
             if text_channel_id is not None:
@@ -3845,7 +3855,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, BasePlatformAd
             if source is not None:
                 self._voice_sources[guild_id] = source
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                if receiver is None:
+                    receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
