@@ -482,6 +482,116 @@ class SessionMessagesMixin:
             return inserted
         return self._execute_transcript_write(_do, messages, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def append_messages_with_receipt(
+        self, session_id: str, messages: List[Dict[str, Any]], *, producer: str,
+        event_id: str, origin_turn_id: str,
+    ) -> Dict[str, Any]:
+        """Atomically append a small passive transcript and durable idempotency receipt.
+
+        This deliberately accepts only plain user/assistant text.  Callers cannot supply
+        arbitrary row fields, and the receipt identity is bound to the canonical bytes of
+        those messages and their declared origin.  Replays return the original receipt;
+        changed content for an existing event is rejected before any row can be inserted.
+        """
+        if not all(isinstance(value, str) and value for value in (session_id, producer, event_id, origin_turn_id)):
+            raise ValueError("Session, producer, event, and origin identifiers must be non-empty strings")
+        if not isinstance(messages, list) or not 1 <= len(messages) <= 2:
+            raise ValueError("Passive receipt writes require one or two messages")
+        canonical_messages = []
+        payload_bytes = 0
+        for message in messages:
+            if not isinstance(message, dict) or set(message) - {"role", "content"}:
+                raise ValueError("Passive receipt messages accept only role and content")
+            role, content = message.get("role"), message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, str):
+                raise ValueError("Passive receipt messages require user/assistant text")
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > 65_536:
+                raise ValueError("Passive receipt message exceeds 65536 bytes")
+            payload_bytes += content_bytes
+            canonical_messages.append({"role": role, "content": content})
+        if payload_bytes > 163_840:
+            raise ValueError("Passive receipt payload exceeds 163840 bytes")
+        payload = json.dumps(
+            {"origin_turn_id": origin_turn_id, "messages": canonical_messages},
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        )
+        payload_digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+        def _receipt(row, *, replayed: bool) -> Dict[str, Any]:
+            message_ids = json.loads(row["message_ids"])
+            return {
+                "producer": row["producer"], "event_id": row["event_id"],
+                "origin_turn_id": row["origin_turn_id"], "conversation_id": row["session_id"],
+                "session_id": row["session_id"], "message_ids": message_ids,
+                "revision": int(row["revision"]), "replayed": replayed,
+            }
+
+        def _do(conn):
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS passive_message_receipts (
+                    session_id TEXT NOT NULL, producer TEXT NOT NULL, event_id TEXT NOT NULL,
+                    origin_turn_id TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
+                    message_ids TEXT NOT NULL, revision INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, producer, event_id)
+                )"""
+            )
+            existing = conn.execute(
+                "SELECT * FROM passive_message_receipts WHERE session_id = ? AND producer = ? AND event_id = ?",
+                (session_id, producer, event_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload_sha256"] != payload_digest or existing["origin_turn_id"] != origin_turn_id:
+                    raise ValueError("Passive receipt event conflicts with its original payload")
+                return _receipt(existing, replayed=True)
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
+                raise ValueError("Passive receipt session does not exist")
+            self._check_transcript_write_guards(conn, session_id, None)
+            inserted, tool_calls = self._insert_message_rows(conn, session_id, [dict(msg) for msg in canonical_messages])
+            self._bump_session_counters(conn, session_id, inserted, tool_calls, unit=False)
+            rows = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?", (session_id, inserted)
+            ).fetchall()
+            message_ids = list(reversed([int(row["id"]) for row in rows]))
+            revision = message_ids[-1]
+            conn.execute(
+                """INSERT INTO passive_message_receipts
+                   (session_id, producer, event_id, origin_turn_id, payload_sha256, message_ids, revision)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, producer, event_id, origin_turn_id, payload_digest,
+                 json.dumps(message_ids, separators=(",", ":")), revision),
+            )
+            return {
+                "producer": producer, "event_id": event_id, "origin_turn_id": origin_turn_id,
+                "conversation_id": session_id, "session_id": session_id, "message_ids": message_ids,
+                "revision": revision, "replayed": False,
+            }
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def get_message_receipt(self, session_id: str, *, producer: str, event_id: str) -> Optional[Dict[str, Any]]:
+        """Return a passive-message receipt without exposing the receipt table to plugins."""
+        if not all(isinstance(value, str) and value for value in (session_id, producer, event_id)):
+            raise ValueError("Session, producer, and event identifiers must be non-empty strings")
+        with self._read_ctx() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT * FROM passive_message_receipts WHERE session_id = ? AND producer = ? AND event_id = ?",
+                    (session_id, producer, event_id),
+                ).fetchone()
+            except Exception as exc:
+                if "no such table" in str(exc).lower():
+                    return None
+                raise
+            if row is None:
+                return None
+            return {
+                "producer": row["producer"], "event_id": row["event_id"],
+                "origin_turn_id": row["origin_turn_id"], "conversation_id": row["session_id"],
+                "session_id": row["session_id"], "message_ids": json.loads(row["message_ids"]),
+                "revision": int(row["revision"]), "replayed": True,
+            }
+
     _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
 
     def _execute_transcript_write(self, fn, messages: List[Dict[str, Any]], **kwargs):
