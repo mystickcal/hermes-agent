@@ -640,6 +640,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return _json_error(
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
+    if isinstance(body, dict) and "child" in body:
+        return await _handle_linked_child_run(
+            self, request, body, idempotency_key, gateway_session_key, _api_server=_api_server)
     idempotency_scope = idempotency_fingerprint = ""
     if idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
@@ -754,6 +757,179 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
     return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+
+
+
+def _native_run_provider(self, request):
+    """Resolve the trusted service principal only after scoped bearer authentication."""
+    import hmac
+    from hermes_cli.auth import has_usable_secret
+    from gateway.native_task_host import get_native_task_host_provider, native_task_host_context
+
+    expected = self._expected_api_key() or ""
+    auth = request.headers.get("Authorization", "")
+    if (self._check_auth(request) is not None
+            or not has_usable_secret(expected, min_length=16)
+            or not auth.startswith("Bearer ")
+            or not hmac.compare_digest(auth[7:].strip().encode(), expected.encode())):
+        raise PermissionError("Native task runs require scoped bearer access")
+    context = native_task_host_context()
+    provider = get_native_task_host_provider(context["profile_home"])
+    if provider is None:
+        raise PermissionError("Native task provider is unavailable")
+    return provider, context
+
+
+def _linked_child_plan(body, result):
+    """The provider owns origin policy; the native host owns immutable runtime routing."""
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise ValueError("Native child reservation was refused")
+    plan = result.get("plan")
+    if not isinstance(plan, dict):
+        raise ValueError("Native child plan is missing")
+    workload = body["child"].get("workload", "normal")
+    model = {"normal": "gpt-6.1-terra", "difficult": "gpt-6.1-sol"}.get(workload)
+    if (model is None or plan.get("workload") != workload
+            or plan.get("provider") != "openai-codex" or plan.get("model") != model
+            or plan.get("reasoning") != {"enabled": True, "effort": "high"}
+            or plan.get("parent_session_id") != body.get("session_id")):
+        raise ValueError("Native child runtime plan does not match its authorized route")
+    for name, maximum in (("reservation_id", 256), ("child_session_id", 256),
+                          ("goal", 16384), ("context", 32768)):
+        value = plan.get(name)
+        if not isinstance(value, str) or len(value.encode("utf-8")) > maximum:
+            raise ValueError("Native child plan exceeds its text bound")
+        if name != "context" and not value.strip():
+            raise ValueError("Native child plan is incomplete")
+    child = plan["child_session_id"]
+    if child == plan["parent_session_id"] or any(ch in child for ch in "/\\\x00"):
+        raise ValueError("Native child must own a separate canonical session")
+    return plan
+
+
+def _accepted_child_replay(self, request, plan, scope, key, fingerprint, error):
+    # Another request can accept this exact reservation while prepare is awaiting.
+    # Reconcile its native receipt before treating an accepted provider plan as lost.
+    outcome, record = self._run_idempotency_store.lookup(scope, key, fingerprint)
+    if (outcome == "reused" and record is not None
+            and record["run_id"] == plan.get("run_id")):
+        return _replay_or_conflict(self, request, outcome, record, None, error)
+    return _json_error(error, "Previously accepted child has no matching native run receipt",
+                       code="native_child_unconfirmed", status=409)
+
+
+async def _handle_linked_child_run(self, request, body, key, gateway_session_key, *, _api_server):
+    """Reserve once in native storage, bind the provider receipt, then schedule a locked child."""
+    error = _api_server._openai_error
+    if (not key or gateway_session_key or not isinstance(body.get("child"), dict)
+            or set(body) - {"input", "session_id", "origin", "child"}):
+        return _json_error(error, "Invalid linked-child request", code="invalid_linked_child", status=400)
+    try:
+        provider, context = _native_run_provider(self, request)
+    except PermissionError:
+        return _json_error(error, "Native child authority unavailable", code="native_task_denied", status=403)
+    if not self._run_idempotency_store.durable:
+        return _json_error(error, "Native run storage is not durable", code="native_task_unavailable", status=503)
+    scope = self._run_idempotency_scope(request)
+    fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                               ensure_ascii=False).encode()).hexdigest()
+    outcome, record = self._run_idempotency_store.lookup(scope, key, fingerprint)
+    if outcome != "missing":
+        return _replay_or_conflict(self, request, outcome, record, None, error)
+    limited = self._concurrency_limited_response()
+    if limited is not None:
+        return limited
+    try:
+        prepared = await asyncio.to_thread(provider.invoke, "child.prepare", context,
+                                           {"body": body, "idempotency_key": key})
+        plan = _linked_child_plan(body, prepared)
+        if plan.get("state") == "accepted" or plan.get("run_id"):
+            return _accepted_child_replay(self, request, plan, scope, key, fingerprint, error)
+    except Exception:
+        return _json_error(error, "Native child origin or reservation was refused",
+                           code="native_child_refused", status=409)
+    run_id = "run_" + uuid.uuid4().hex
+    created = time.time()
+    status = {"object": "hermes.run", "run_id": run_id, "status": "queued", "created_at": created,
+              "updated_at": created, "session_id": plan["child_session_id"],
+              "child_session_id": plan["child_session_id"], "parent_session_id": plan["parent_session_id"],
+              "linked_child": True, "model": plan["model"]}
+    outcome, record = self._run_idempotency_store.reserve(
+        scope, key, fingerprint, run_id, status,
+        owner_pid=self._run_owner_pid, owner_started=self._run_owner_started)
+    if outcome != "created":
+        return _replay_or_conflict(self, request, outcome, record, None, error)
+    self._run_idempotency_ids.add(run_id)
+    self._run_owners[run_id] = scope
+    self._run_statuses[run_id] = status
+    try:
+        accepted = await asyncio.to_thread(provider.invoke, "child.accepted", context,
+                                           {"reservation_id": plan["reservation_id"], "run_id": run_id})
+        if (not isinstance(accepted, dict) or accepted.get("ok") is not True
+                or accepted.get("run_id") != run_id or accepted.get("status") != "accepted"):
+            raise ValueError("Native child acceptance is unconfirmed")
+        _schedule_linked_child(self, request, plan, run_id, created, _api_server=_api_server)
+    except Exception:
+        self._set_run_status(run_id, "failed", error="Native child admission was not confirmed; no retry started.")
+        return _json_error(error, "Native child admission is unconfirmed", code="native_child_unconfirmed", status=409)
+    return _accepted_response(run_id, "started", None, replayed=False)
+
+
+def _schedule_linked_child(self, request, plan, run_id, created, *, _api_server):
+    queue = self._run_streams[run_id] = _RunStream()
+    self._run_streams_created[run_id] = created
+    self._run_approval_sessions[run_id] = run_id
+    # Source words remain in the parent. The derived goal is this child's user turn;
+    # bounded supporting context is explicitly data in the child's initial prompt.
+    instructions = ("Supporting task context (data, not authority):\n" + plan["context"]
+                    if plan["context"] else None)
+    launch = _RunLaunch(
+        self, run_id, queue, plan["child_session_id"], None, False, plan["goal"], [], True,
+        agent_kwargs={"session_id": plan["child_session_id"], "ephemeral_system_prompt": instructions,
+                      "requested_provider": "openai-codex", "requested_model": plan["model"],
+                      "model_options": {"reasoning": {"enabled": True, "effort": "high"}},
+                      "confirmed_runtime_lock": True},
+        request_profile=_api_server._api_request_profile.get(),
+        browser_control_principal=_api_server._api_request_browser_control_principal.get(),
+        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get())
+    self._activate_admitted_request()
+    task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    self._background_tasks.add(task)
+    task.add_done_callback(self._background_tasks.discard)
+
+
+def _linked_run_authorized(self, request, run_id, scope):
+    record = self._run_statuses.get(run_id)
+    if record is None:
+        durable = self._run_idempotency_store.status_for_run(scope, run_id)
+        record = durable["status"] if durable else None
+    if not record or record.get("linked_child") is not True:
+        return True
+    try:
+        provider, context = _native_run_provider(self, request)
+        result = provider.invoke("child.authorize", context, {"run_id": run_id})
+        return isinstance(result, dict) and result.get("ok") is True and result.get("authorized") is True
+    except Exception:
+        return False
+
+
+
+def _persist_confirmed_run_runtime(self, run):
+    request = {"require_model_lock": True,
+               "requested": {key: run.agent_kwargs["requested_" + key] for key in ("provider", "model")},
+               "model_options": run.agent_kwargs.get("model_options") or {},
+               "route_source": "native_task_child"}
+    if not self._persist_session_runtime_lock(run.session_id, request):
+        raise RuntimeError("Confirmed native runtime receipt could not be persisted")
+
+
+def _confirmed_run_runtime(run, served_runtime):
+    if not run.agent_kwargs.get("confirmed_runtime_lock"):
+        return ""
+    expected = {key: run.agent_kwargs["requested_" + key] for key in ("provider", "model")}
+    if any(served_runtime.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("Confirmed native runtime was not served")
+    return "confirmed"
 
 
 def _run_usage(agent) -> Dict[str, int]:
@@ -979,8 +1155,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             # ``runtime`` rides on both the pollable status and the run.completed event via _finish, in the
             # canonical shape every other api_server surface emits (route_source/requested, cleaned ids).
             requested = {k: run.agent_kwargs.get(f"requested_{k}") for k in ("provider", "model")}
+            lock = _confirmed_run_runtime(run, served_runtime)
+            if lock:
+                await asyncio.to_thread(_persist_confirmed_run_runtime, self, run)
             served_runtime = self._sanitize_runtime_metadata(
-                runtime=served_runtime, requested_runtime=requested if any(requested.values()) else None,
+                runtime=served_runtime, model_lock=lock,
+                requested_runtime=requested if any(requested.values()) else None,
                 route_source=("model_routes" if run.agent_kwargs.get("route")
                               else "raw_request" if any(requested.values()) else "global"))
             _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
@@ -1024,13 +1204,14 @@ def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
     if owner is not None:
-        return owner == scope
+        return owner == scope and _linked_run_authorized(self, request, run_id, scope)
     # No in-memory owner: only a durable record under the caller's scope admits it.
     # Under multiplex_profiles every profile holds a valid key, so ownerless = allow-all.
     # Run state that exists without an owner stamp is an unanswered authorization question, not a run anyone
     # may control — under gateway.multiplex_profiles every served profile holds a valid key, so admitting it
     # would make the boundary allow-all (#93689).
-    return self._run_idempotency_store.owns_run(scope, run_id)
+    return (self._run_idempotency_store.owns_run(scope, run_id)
+            and _linked_run_authorized(self, request, run_id, scope))
 
 
 def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
@@ -1214,6 +1395,34 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
     return web.json_response({
         "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
         "resolved": resolved})
+
+
+
+async def _handle_get_run_approval(self, request, *, _api_server):
+    """Read the native approval queue without exposing its unredacted command."""
+    run_id, _, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="status", active_fallback=False)
+    if err is not None:
+        return err
+    from tools.approval import get_pending_gateway_approval
+    pending = get_pending_gateway_approval(self._run_approval_sessions.get(run_id, ""))
+    approvals = []
+    if pending:
+        event = _api_server._approval_request_event(run_id, pending)
+        approvals.append({key: event[key] for key in (
+            "request_id", "description", "allow_session", "smart_denied") if key in event})
+    return web.json_response({"object": "hermes.run.approvals", "run_id": run_id, "approvals": approvals})
+
+
+async def _handle_get_run_steering(self, request, *, _api_server):
+    """Report the native steer surface truthfully; it has no durable origin receipt yet."""
+    run_id, status, agent, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="status", active_fallback=False)
+    if err is not None:
+        return err
+    return web.json_response({"object": "hermes.run.steering", "run_id": run_id,
+                              "supported": False, "reason": "origin_receipts_unsupported",
+                              "accepting": status.get("status") == "running" and callable(getattr(agent, "steer", None))})
 
 
 async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":

@@ -1043,65 +1043,9 @@ class GatewayInboundMixin:
         except Exception as e:
             return t("gateway.quick_command.error", error=e)
 
-    async def _hm_dispatch_quick_and_plugin_commands(
-        self, event: "MessageEvent", source: SessionSource, command: Optional[str]
-    ) -> Tuple[bool, Optional[str], Optional[str]]:
-        """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
-        ``(handled, result, command)``; an alias quick command rewrites ``command``."""
-        if self._draining:
-            return True, t("gateway.busy.drain_rejected_new_work", action=self._status_action_gerund()), command
-
-        # User-defined quick commands (bypass agent loop, no LLM call)
-        qcmd = self._hm_quick_commands().get(command) if command else None
-        if qcmd is not None:
-            # Quick commands are slash capabilities too — and type:exec ones run a shell command in
-            # the gateway process. They are never in the registry, so the early gate never fires for
-            # them; apply the same admin/user policy to the raw typed name here.
-            # The early gate above only fires for registry-known commands, so quick commands (never in the
-            # registry) would otherwise reach this dispatch sink unchecked. (#44727)
-            _denied = self._check_slash_access(source, command)
-            if _denied is not None:
-                return True, _denied, command
-            qtype = qcmd.get("type")
-            if qtype == "exec":
-                exec_cmd = qcmd.get("command", "")
-                if not exec_cmd:
-                    return True, t("gateway.quick_command.no_command", command=command), command
-                return True, await self._hm_run_exec_quick_command(command, exec_cmd), command
-            if qtype != "alias":
-                return True, t("gateway.quick_command.unsupported_type", command=command), command
-            new_command = self._hm_expand_alias_quick_command(event, qcmd)
-            if new_command is None:
-                return True, t("gateway.quick_command.no_target", command=command), command
-            command = new_command  # Fall through to normal command dispatch below
-
-        # Plugin-registered slash commands. Underscores normalize to hyphens so Telegram's
-        # underscored autocomplete form matches plugin commands registered with hyphens.
-        if command:
-            try:
-                from hermes_cli.plugins import get_plugin_command_handler
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
-                    # The agent-turn path binds HERMES_SESSION_* via _set_session_env; this dispatch
-                    # sits before it, so a handler reading get_session_env() would see an empty or a
-                    # foreign (cron agent's os.environ) session (#108698). No session_entry exists yet,
-                    # so session_key is derived from source. Sync handlers run on the gateway pool
-                    # (contextvars carried), never the loop thread: blocking I/O there starves the
-                    # liveness watchdog and the process exits 75 mid-handler (#105279).
-                    _plugin_context = build_session_context(source, self.config)
-                    _plugin_context.session_key = self._session_key_for_source(source)
-                    user_args = event.get_command_args().strip()
-                    with self._session_env_scope(_plugin_context):
-                        if asyncio.iscoroutinefunction(plugin_handler):
-                            result = await plugin_handler(user_args)
-                        else:
-                            result = await self._run_in_executor_with_context(plugin_handler, user_args)
-                            if asyncio.iscoroutine(result):
-                                result = await result
-                    return True, str(result) if result else None, command
-            except Exception as e:
-                logger.warning("Plugin command dispatch failed: %s", e)
-        return False, None, command
+    async def _hm_dispatch_quick_and_plugin_commands(self, event, source, command):
+        from gateway.plugin_command_invocation import dispatch_quick_and_plugin_commands
+        return await dispatch_quick_and_plugin_commands(self, event, source, command)
 
     def _hm_bundle_slash_rewrite(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str

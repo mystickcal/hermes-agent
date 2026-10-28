@@ -3764,51 +3764,26 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, BasePlatformAd
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    def native_task_room_context(self, guild_id, channel_id, operator_user_id):
+        from plugins.platforms.discord.task_voice_context import current_discord_room
+        room = current_discord_room(self, {
+            "guild_id": guild_id, "channel_id": channel_id, "operator_user_id": operator_user_id})
+        if room is None:
+            return None
+        fields = ("guild_id", "channel_id", "operator_user_id", "audience_user_ids", "audience_revision")
+        return {"surface": "discord", **{key: room[key] for key in fields}}
+
+    async def native_task_invocation_context(self, raw_message, source, anchor_session_id):
+        if not isinstance(raw_message, discord.Interaction):
+            return None
+        from plugins.platforms.discord.task_voice_context import native_task_invocation_context
+        return await native_task_invocation_context(self, raw_message, source, anchor_session_id)
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
-        """Join a voice channel; returns True on success. ``text_channel_id`` stores the
-        transcription-routing binding so programmatic joins work without ``/voice join``."""
-        if not self._client or not DISCORD_AVAILABLE:
-            return False
-        guild_id = channel.guild.id
-        async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            existing = self._voice_clients.get(guild_id)
-            if existing and existing.is_connected():
-                if existing.channel.id == channel.id:
-                    self._reset_voice_timeout(guild_id)
-                    return True
-                await existing.move_to(channel)
-                self._reset_voice_timeout(guild_id)
-                return True
-            try:
-                from voice_startup import connect_with_receiver
-            except ImportError:
-                from .voice_startup import connect_with_receiver
-            vc, receiver = await connect_with_receiver(
-                channel, lambda voice: VoiceReceiver(voice, allowed_user_ids=self._allowed_user_ids)
-            )
-            self._voice_clients[guild_id] = vc
-            self._reset_voice_timeout(guild_id)
-            if text_channel_id is not None:
-                self._voice_text_channels[guild_id] = text_channel_id
-            if source is not None:
-                self._voice_sources[guild_id] = source
-            try:
-                if receiver is None:
-                    receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
-                receiver.start()
-                self._voice_receivers[guild_id] = receiver
-                self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-                    self._voice_listen_loop(guild_id)
-                )
-            except Exception as e:
-                logger.warning("Voice receiver failed to start: %s", e)
-            # Mixer is best-effort; failure falls back to one-shot FFmpegPCMAudio playback.
-            if getattr(self, "_voice_fx_cfg", {}).get("enabled"):
-                try:
-                    await self._install_voice_mixer(guild_id, vc)
-                except Exception as e:
-                    logger.warning("Voice mixer failed to start: %s", e)
-            return True
+        from plugins.platforms.discord.task_voice_context import join_voice_channel
+        return await join_voice_channel(
+            self, channel, receiver_type=VoiceReceiver, discord_available=DISCORD_AVAILABLE,
+            text_channel_id=text_channel_id, source=source)
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""

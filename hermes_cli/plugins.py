@@ -676,7 +676,7 @@ class PluginContext:
     @_serialized_replacement
     def register_command(
         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
-        argument_mode: str | None = None,
+        argument_mode: str | None = None, invocation_context: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
         (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
@@ -697,6 +697,7 @@ class PluginContext:
             "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
             "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
             else ("text" if hint else None),
+            "invocation_context": bool(invocation_context),
         }
         return self._register_entry("command", clean, self._manager._plugin_commands, entry,
                                     "Plugin %s registered command: /%s", clean)
@@ -713,42 +714,13 @@ class PluginContext:
         return registry.dispatch(tool_name, args, scope=self._manager.scope_key, **kwargs)
 
     @_serialized_replacement
-    def register_context_engine(self, engine) -> Optional[PluginRegistration]:
-        """Register the (single) ``agent.context_engine.ContextEngine`` replacing the built-in
-        ContextCompressor; a second registration is rejected with a warning."""
-        if self._manager._context_engine is not None:
-            logger.warning("Plugin '%s' tried to register a context engine, but one is "
-                           "already registered. Only one context engine plugin is allowed.",
-                           self.manifest.name)
-            return
-        from agent.context_engine import ContextEngine
-        if self._wrong_type(engine, ContextEngine, "context engine"):
-            return
-        previous = self._manager._context_engine  # always None here; kept for the restore contract
-        self._manager._context_engine = engine
-        handle = self._track_replacement(
-            "context_engine", engine.name, slot=("manager_value", id(self._manager), "_context_engine"),
-            current=engine, previous=previous,
-            restore=lambda replacement: self._manager._restore_value("_context_engine", engine, replacement),
-        )
-        logger.info("Plugin '%s' registered context engine: %s", self.manifest.name, engine.name)
-        return handle
+    def register_context_engine(self, engine):
+        from hermes_cli.plugins_capability_ctx import register_context_engine
+        return register_context_engine(self, engine)
 
-    def register_context_reference(self, provider) -> None:
-        """Register a :class:`agent.context_references.ContextReferenceProvider`; ``provider.prefix``
-        defines ``@<prefix>:``. Built-in prefixes (diff, staged, file, folder, git, url) are
-        rejected."""
-        from agent.context_references import (
-            ContextReferenceProvider as _CRP, register_context_reference_provider as _register,
-        )
-        if self._wrong_type(provider, _CRP, "context reference provider"):
-            return
-        try:
-            _register(provider)
-        except ValueError as exc:
-            logger.warning("Plugin '%s' context reference registration failed: %s", self.manifest.name, exc)
-            return
-        logger.info("Plugin '%s' registered context reference: @%s:", self.manifest.name, provider.prefix)
+    def register_context_reference(self, provider):
+        from hermes_cli.plugins_capability_ctx import register_context_reference
+        return register_context_reference(self, provider)
 
     def register_memory_provider(self, provider) -> None:
         """Record a memory provider (inert). Activation is owned by ``plugins/memory`` via
@@ -1083,6 +1055,15 @@ class PluginContext:
         }
         return self._register_entry("skill", qualified, self._manager._plugin_skills, entry,
                                     "Plugin %s registered skill: %s", qualified)
+
+    def get_native_task_host_context(self):
+        from gateway.native_task_host import native_task_host_context
+        return native_task_host_context(profile_home=self._manager.scope_key)
+
+    @_serialized_replacement
+    def register_native_task_host_provider(self, provider):
+        from hermes_cli.plugins_capability_ctx import register_native_task_host_provider
+        return register_native_task_host_provider(self, provider)
 
 
 # -- scoped provider registrars ------------------------------------------------------------------
@@ -2248,9 +2229,15 @@ def get_plugin_context_engine():
     return _ensure_plugins_discovered()._context_engine
 
 
+def get_plugin_command_entry(name: str) -> Optional[dict]:
+    """Return immutable command metadata after plugin discovery."""
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    return dict(entry) if entry else None
+
+
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
-    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    entry = get_plugin_command_entry(name)
     return entry["handler"] if entry else None
 
 
