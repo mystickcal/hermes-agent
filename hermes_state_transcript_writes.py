@@ -8,10 +8,12 @@ from typing import Any, Dict, List, Optional
 
 from hermes_state_common import _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _ended_by_compression
 
+_TURN_LEASE_ROW_SQL = "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?"
 _DELETE_COMPRESSION_LOCK_SQL = "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?"
 
 
 class SessionTranscriptWritesMixin:
+    @staticmethod
     def _stale_holder(row, now: float) -> bool:
 
         """A lock/lease row whose holder is expired or a provably dead local process."""
@@ -78,7 +80,7 @@ class SessionTranscriptWritesMixin:
 
                 if active_lock is not None:
 
-                    if _stale_holder(active_lock, time.time()):
+                    if self._stale_holder(active_lock, time.time()):
 
                         conn.execute(_DELETE_COMPRESSION_LOCK_SQL, (session_id, active_lock["holder"]))
 
@@ -118,7 +120,7 @@ class SessionTranscriptWritesMixin:
 
                 elif lease is not None:
 
-                    if not _stale_holder(lease, now):
+                    if not self._stale_holder(lease, now):
 
                         raise SessionTurnLeaseLostError(
 

@@ -101,3 +101,25 @@ def test_passive_receipt_tracks_native_counters_and_refuses_deleted_replay(db):
             "voice-session", [{"role": "user", "content": "one"}],
             producer="passive.ingress.v1", event_id="event-delete", origin_turn_id="turn-1",
         )
+
+
+def test_ordinary_append_batch_and_live_turn_lease_keep_working(db):
+    first = db.append_message("voice-session", "user", "anchor")
+    assert first > 0
+    assert db.append_messages_batch(
+        "voice-session", [{"role": "assistant", "content": "batch"}]
+    ) == 1
+
+    def seed_lease(conn):
+        conversation_id = db._session_turn_lease_key_on_conn(conn, "voice-session")
+        conn.execute(
+            "INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) "
+            "VALUES (?, ?, ?, ?)", (conversation_id, "live-owner", 0, 9999999999)
+        )
+    db._execute_write(seed_lease)
+    assert db.append_message(
+        "voice-session", "user", "leased", turn_lease_holder="live-owner"
+    ) > first
+    assert [message["content"] for message in db.get_messages("voice-session")] == [
+        "anchor", "batch", "leased"
+    ]

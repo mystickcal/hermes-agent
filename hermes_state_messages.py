@@ -305,8 +305,6 @@ class SessionMessagesMixin(SessionTranscriptWritesMixin):
                     )
         return msg
 
-    @staticmethod
-
     def append_message(
         self, session_id: str, role: str, content: str = None, tool_name: str = None, tool_calls: Any = None,
         tool_call_id: str = None, token_count: int = None, finish_reason: str = None, reasoning: str = None,
