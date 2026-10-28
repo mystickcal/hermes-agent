@@ -73,6 +73,8 @@ async def dispatch_quick_and_plugin_commands(
                         if asyncio.iscoroutine(result):
                             result = await result
                 return True, str(result) if result else None, command
-        except Exception as e:
-            logger.warning("Plugin command dispatch failed: %s", e)
+        except Exception:
+            logger.exception('Plugin command dispatch failed (details redacted)',
+                exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+                stack_info=True)
     return False, None, command

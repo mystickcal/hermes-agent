@@ -73,16 +73,16 @@ def environment(monkeypatch):
             provider="openai-codex", model="gpt-6.1-terra", session_id=kwargs["session_id"],
             reasoning_config={"enabled": True, "effort": "high"}, tools=[], _fallback_chain=[],
             _hermes_api_runtime={"provider": "openai-codex", "model": "gpt-6.1-terra"})
-        if owner.problem == "model":
-            agent.model = "other"
-        elif owner.problem == "provider":
-            agent.provider = "openai"
-        elif owner.problem == "reasoning":
-            agent.reasoning_config = {"enabled": True, "effort": "low"}
-        elif owner.problem == "tools":
-            agent.tools = [{"function": {"name": "terminal"}}]
-        elif owner.problem == "fallback":
-            agent._fallback_chain = [{"provider": "openai", "model": "other"}]
+        changes = {
+            "model": ("model", "other"),
+            "provider": ("provider", "openai"),
+            "reasoning": ("reasoning_config", {"enabled": True, "effort": "low"}),
+            "tools": ("tools", [{"function": {"name": "terminal"}}]),
+            "fallback": ("_fallback_chain", [{"provider": "openai", "model": "other"}]),
+        }
+        if owner.problem in changes:
+            attribute, value = changes[owner.problem]
+            setattr(agent, attribute, value)
         kwargs["agent_ref"][0] = agent
         output = owner.output if isinstance(owner.output, str) else json.dumps(owner.output)
         return owner._finish_turn_result(
@@ -174,3 +174,20 @@ def test_provider_fault_ends_only_the_new_decision_session(environment):
     sid = owner.calls[0]["session_id"]
     assert db.get_session(sid)["end_reason"] == "native_task_decision_failed"
     assert not db.get_session("unrelated")["end_reason"]
+
+
+def test_untrusted_exception_names_values_and_frames_are_not_retained(environment, caplog):
+    import logging
+    owner, _ = environment
+    marker = "private_credential_marker_1234"
+    exception_type = type(marker, (Exception,), {})
+    async def fail(**kwargs):
+        owner.calls.append(kwargs)
+        raise exception_type(marker + "_value") from ValueError(marker + "_cause")
+    owner._run_agent = fail
+    caplog.set_level(logging.ERROR)
+    assert asyncio.run(decisions.handle(owner, Request(request_body()))).status == 502
+    assert marker not in caplog.text
+    records = [record for record in caplog.records if record.name == decisions.__name__]
+    assert records and all(record.exc_info[2] is None for record in records)
+    assert all(type(record.exc_info[1]) is RuntimeError for record in records)

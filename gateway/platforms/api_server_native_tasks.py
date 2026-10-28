@@ -2,9 +2,12 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 from functools import partial
 from aiohttp import web
 from gateway.native_task_host import get_native_task_host_provider, native_task_host_context
+
+logger = logging.getLogger(__name__)
 
 def _error(code, status=403, *, retryable=False):
     return web.json_response({"error": code, "retryable": retryable}, status=status)
@@ -72,6 +75,9 @@ async def _call(self, request, operation, fields=None):
                 return _error("unauthorized", 403)
         result = await asyncio.to_thread(provider.invoke, operation, context, body)
     except Exception:
+        logger.exception('Native task provider failed (details redacted)',
+            exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+            stack_info=True)
         return _error("unavailable", 502, retryable=True)
     return _project(operation, result)
 

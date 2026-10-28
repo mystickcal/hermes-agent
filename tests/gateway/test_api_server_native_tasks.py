@@ -234,3 +234,14 @@ def test_concurrent_prepare_replays_a_matching_accepted_native_receipt(environme
         await asyncio.gather(*owner._active_run_tasks.values())
         assert len(launches) == 1
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("payload,expected,error", [
+    ({"input": "Original words"}, ("Original words", "Original words"), None),
+    ({"input": [{"role": "user", "content": "Original words"}]},
+     ([{"role": "user", "content": "Original words"}], "Original words"), None),
+    ({}, None, "Missing 'input' field"),
+    ({"input": [{"role": "user", "content": ""}]}, None, "No user message found in input"),
+])
+def test_ordinary_run_input_preserves_native_text_and_missing_input_contract(payload, expected, error):
+    assert runs._run_input_parts(payload) == (expected, error)

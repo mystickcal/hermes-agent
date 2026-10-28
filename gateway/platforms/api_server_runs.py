@@ -617,6 +617,23 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
             _api_server._api_request_profile.reset(token)
 
 
+def _run_input_parts(body):
+    raw_input = body.get("input")
+    if not raw_input:
+        return None, "Missing 'input' field"
+    if isinstance(raw_input, str):
+        user_message = raw_input
+    else:
+        user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
+    if not user_message:
+        return None, "No user message found in input"
+    return (raw_input, user_message), None
+
+
+def _valid_run_idempotency_key(key):
+    return len(key) <= 255 and all(33 <= ord(ch) <= 126 for ch in key)
+
+
 async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
@@ -636,7 +653,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
             if isinstance(body, dict) else (None, None)))
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
-    if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
+    if not _valid_run_idempotency_key(idempotency_key):
         return _json_error(
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
@@ -650,15 +667,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             {"body": body, "gateway_session_key": gateway_session_key or ""},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode()).hexdigest()
-    raw_input = body.get("input")
-    if not raw_input:
-        return _json_error(_openai_error, "Missing 'input' field", status=400)
-    if isinstance(raw_input, str):
-        user_message = raw_input
-    else:
-        user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
-    if not user_message:
-        return _json_error(_openai_error, "No user message found in input", status=400)
+    input_parts, input_error = _run_input_parts(body)
+    if input_error is not None:
+        return _json_error(_openai_error, input_error, status=400)
+    raw_input, user_message = input_parts
     try:
         turn_author = _api_server._request_turn_author(body)
     except ValueError as exc:
@@ -846,6 +858,9 @@ async def _handle_linked_child_run(self, request, body, key, gateway_session_key
         if plan.get("state") == "accepted" or plan.get("run_id"):
             return _accepted_child_replay(self, request, plan, scope, key, fingerprint, error)
     except Exception:
+        logger.exception('Native child reservation failed (details redacted)',
+            exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+            stack_info=True)
         return _json_error(error, "Native child origin or reservation was refused",
                            code="native_child_refused", status=409)
     run_id = "run_" + uuid.uuid4().hex
@@ -870,6 +885,9 @@ async def _handle_linked_child_run(self, request, body, key, gateway_session_key
             raise ValueError("Native child acceptance is unconfirmed")
         _schedule_linked_child(self, request, plan, run_id, created, _api_server=_api_server)
     except Exception:
+        logger.exception('Native child admission failed (details redacted)',
+            exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+            stack_info=True)
         self._set_run_status(run_id, "failed", error="Native child admission was not confirmed; no retry started.")
         return _json_error(error, "Native child admission is unconfirmed", code="native_child_unconfirmed", status=409)
     return _accepted_response(run_id, "started", None, replayed=False)
@@ -910,6 +928,9 @@ def _linked_run_authorized(self, request, run_id, scope):
         result = provider.invoke("child.authorize", context, {"run_id": run_id})
         return isinstance(result, dict) and result.get("ok") is True and result.get("authorized") is True
     except Exception:
+        logger.exception('Native child ownership check failed (details redacted)',
+            exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+            stack_info=True)
         return False
 
 

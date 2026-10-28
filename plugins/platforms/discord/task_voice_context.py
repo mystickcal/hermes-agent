@@ -132,12 +132,16 @@ async def join_voice_channel(self, channel, *, receiver_type, discord_available,
             self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
                 self._voice_listen_loop(guild_id)
             )
-        except Exception as e:
-            logger.warning("Voice receiver failed to start: %s", e)
+        except Exception:
+            logger.exception('Voice receiver failed (details redacted)',
+                exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+                stack_info=True)
         # Mixer is best-effort; failure falls back to one-shot FFmpegPCMAudio playback.
         if getattr(self, "_voice_fx_cfg", {}).get("enabled"):
             try:
                 await self._install_voice_mixer(guild_id, vc)
-            except Exception as e:
-                logger.warning("Voice mixer failed to start: %s", e)
+            except Exception:
+                logger.exception('Voice mixer failed (details redacted)',
+                    exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+                    stack_info=True)
         return True

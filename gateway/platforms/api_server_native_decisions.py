@@ -8,6 +8,8 @@ import uuid
 
 from aiohttp import web
 
+logger = logging.getLogger(__name__)
+
 MODEL = "gpt-6.1-terra"
 PROVIDER = "openai-codex"
 MODEL_OPTIONS = {"reasoning": {"enabled": True, "effort": "high"}}
@@ -145,13 +147,18 @@ async def handle(self, request):
             raise ValueError("Decision runtime receipt was not persisted")
         end_reason = "native_task_decision"
     except Exception:
+        # Do not retain provider exception values, types, chains or traceback frames.
+        logger.exception('Native decision failed (details redacted)',
+            exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+            stack_info=True)
         return _error("native_decision_unconfirmed", 502)
     finally:
         try:
             await asyncio.to_thread(db.end_session, session_id, end_reason)
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "Native decision session finalization failed: %s", type(exc).__name__)
+        except Exception:
+            logger.exception('Native decision finalization failed (details redacted)',
+                exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+                stack_info=True)
     return web.json_response({"decision": decision, "runtime": runtime, "session_id": session_id})
 
 
