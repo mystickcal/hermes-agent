@@ -245,3 +245,237 @@ def test_concurrent_prepare_replays_a_matching_accepted_native_receipt(environme
 ])
 def test_ordinary_run_input_preserves_native_text_and_missing_input_contract(payload, expected, error):
     assert runs._run_input_parts(payload) == (expected, error)
+
+
+# Ordinary locked requests share this module with Talk's native child producer.
+# Exercise the real HTTP parsers, SessionDB, native idempotency and worker seam.
+@pytest.fixture
+def ordinary_locked_runtime(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+        "key": "ordinary-locked-test-key-0123456789"}))
+    db = adapter._ensure_session_db()
+    assert db is not None and adapter._run_idempotency_store.durable
+    state = SimpleNamespace(launches=[], mailbox_launches=[],
+        started=asyncio.Event(), release=asyncio.Event(), last_request=None)
+    state.release.set()
+    state.resolve = Mock(return_value={"provider": "openai-codex"})
+    monkeypatch.setattr(adapter, "_resolve_provider_runtime", state.resolve)
+    state.mailbox = AsyncMock(return_value=None)
+    monkeypatch.setattr(adapter, "_admit_to_live_bot_chat", state.mailbox)
+    state.activate = Mock(wraps=adapter._activate_admitted_request)
+    monkeypatch.setattr(adapter, "_activate_admitted_request", state.activate)
+
+    async def execute(owner, launch, **kwargs):
+        state.launches.append(launch)
+        state.started.set()
+        await state.release.wait()
+        owner._set_run_status(launch.run_id, "completed", output="test transport complete")
+        runs._retire_live_run(owner, launch.run_id)
+
+    async def mailbox_execute(owner, launch, *delivery, **kwargs):
+        state.mailbox_launches.append((launch, delivery))
+        owner._set_run_status(launch.run_id, "completed", output="test mailbox complete")
+        runs._retire_live_run(owner, launch.run_id)
+
+    monkeypatch.setattr(runs, "_execute_run", execute)
+    monkeypatch.setattr(runs, "_execute_run_via_live_owner", mailbox_execute)
+    yield adapter, db, state
+    adapter._run_idempotency_store.close()
+    db.close()
+
+
+def _ordinary_locked_body(session_id=None):
+    value = {"input": "Inspect the requested native task", "provider": "openai-codex",
+             "model": "gpt-6.1-terra", "require_model_lock": True,
+             "model_options": {"reasoning": {"enabled": True, "effort": "high"}}}
+    if session_id is not None:
+        value["session_id"] = session_id
+    return value
+
+
+def _ordinary_runs_app(adapter, state):
+    from aiohttp import web
+
+    @web.middleware
+    async def observe(request, handler):
+        state.last_request = request
+        return await handler(request)
+
+    app = web.Application(middlewares=[observe])
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    return app
+
+
+def _ordinary_headers(key):
+    return {"Authorization": "Bearer ordinary-locked-test-key-0123456789", "Idempotency-Key": key}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault,expected", [
+    ("route_provider", 400), ("route_key", 400), ("route_url", 400),
+    ("provider_unavailable", 409), ("provider_mismatch", 409),
+])
+async def test_ordinary_locked_refusal_precedes_native_reservation(
+    ordinary_locked_runtime, fault, expected,
+):
+    from aiohttp.test_utils import TestClient, TestServer
+    adapter, _, state = ordinary_locked_runtime
+    payload = _ordinary_locked_body()
+    if fault.startswith("route_"):
+        payload["model"] = "locked-alias"
+        route = {"model": "gpt-6.1-terra", "provider": "openai-codex"}
+        if fault == "route_provider":
+            route["provider"] = "openai"
+        elif fault == "route_key":
+            route["api_key"] = "dummy-route-credential"
+        else:
+            route["base_url"] = "https://invalid.example/v1"
+        adapter._model_routes["locked-alias"] = route
+    elif fault == "provider_unavailable":
+        state.resolve.side_effect = RuntimeError("fixture provider unavailable")
+    else:
+        state.resolve.return_value = {"provider": "openai"}
+    async with TestClient(TestServer(_ordinary_runs_app(adapter, state))) as client:
+        response = await client.post("/v1/runs", json=payload, headers=_ordinary_headers("refused"))
+        assert response.status == expected
+        await response.json()
+    scope = adapter._run_idempotency_scope(state.last_request)
+    assert adapter._run_idempotency_store.lookup(scope, "refused", "unused") == ("missing", None)
+    assert not state.launches and not state.mailbox_launches
+    assert not adapter._run_owners and not adapter._run_statuses and not adapter._run_streams
+    assert not adapter._run_approval_sessions and not adapter._active_run_tasks
+    assert state.activate.call_count == 0 and adapter.active_agent_work_count() == 0
+    assert state.mailbox.await_count == 0
+    assert state.resolve.call_count == (0 if fault.startswith("route_") else 1)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_locked_accepted_replay_bypasses_failed_provider_and_full_capacity(
+    ordinary_locked_runtime,
+):
+    from aiohttp.test_utils import TestClient, TestServer
+    adapter, _, state = ordinary_locked_runtime
+    adapter._max_concurrent_runs = 1
+    state.release.clear()
+    payload = _ordinary_locked_body()
+    async with TestClient(TestServer(_ordinary_runs_app(adapter, state))) as client:
+        try:
+            first = await client.post("/v1/runs", json=payload, headers=_ordinary_headers("accepted"))
+            assert first.status == 202
+            original = await first.json()
+            await asyncio.wait_for(state.started.wait(), 3)
+            assert adapter._concurrency_limited_response().status == 429
+            state.resolve.side_effect = RuntimeError("fixture provider is now unavailable")
+            retry = await client.post("/v1/runs", json=payload, headers=_ordinary_headers("accepted"))
+            assert retry.status == 202
+            replay = await retry.json()
+            assert replay["run_id"] == original["run_id"] and replay["replayed"] is True
+            changed = {**payload, "input": "Different request"}
+            conflict = await client.post("/v1/runs", json=changed, headers=_ordinary_headers("accepted"))
+            assert conflict.status == 409
+            assert len(state.launches) == 1 and state.resolve.call_count == 1
+        finally:
+            state.release.set()
+            await asyncio.gather(*list(adapter._active_run_tasks.values()))
+
+
+@pytest.mark.asyncio
+async def test_ordinary_locked_canonical_compression_lineage_refuses_without_mailbox_delivery(
+    ordinary_locked_runtime,
+):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_state import SessionDB
+    from hermes_constants import get_hermes_home
+    adapter, db, state = ordinary_locked_runtime
+    db.create_session("canonical", "hermes_browser")
+    db.set_session_title("canonical", SessionDB.CANONICAL_BOT_CHAT_TITLE)
+    db.end_session("canonical", "compression")
+    db.create_session("canonical-tip", "hermes_browser", parent_session_id="canonical")
+    assert {"canonical", "canonical-tip"}.issubset(set(db.get_compression_lineage("canonical-tip")))
+    payload = _ordinary_locked_body("canonical-tip")
+    async with TestClient(TestServer(_ordinary_runs_app(adapter, state))) as client:
+        locked = await client.post("/v1/runs", json=payload, headers=_ordinary_headers("locked-owner"))
+        assert locked.status == 409
+        await locked.json()
+        scope = adapter._run_idempotency_scope(state.last_request)
+        assert adapter._run_idempotency_store.lookup(scope, "locked-owner", "unused") == ("missing", None)
+        assert not adapter._run_owners and not adapter._run_statuses and not adapter._run_streams
+        assert not state.launches and state.mailbox.await_count == 0
+        assert state.activate.call_count == 0 and adapter.active_agent_work_count() == 0
+        # An unlocked request still follows the original, owner-controlled mailbox route.
+        state.mailbox.return_value = (get_hermes_home(), {"delivery_id": "fixture-delivery", "status": "queued"})
+        unlocked = {**payload, "require_model_lock": False}
+        accepted = await client.post("/v1/runs", json=unlocked, headers=_ordinary_headers("unlocked-owner"))
+        assert accepted.status == 202
+        await accepted.json()
+        await asyncio.gather(*list(adapter._active_run_tasks.values()))
+        assert state.mailbox.await_count == 1 and len(state.mailbox_launches) == 1
+        assert not state.launches
+
+
+class _ServedFixtureAgent:
+    def __init__(self, session_id, mismatch):
+        self.session_id = session_id
+        self.provider = "openai" if mismatch == "provider" else "openai-codex"
+        self.model = "other-model" if mismatch == "model" else "gpt-6.1-terra"
+        self._hermes_api_runtime = {"provider": "openai-codex", "model": "gpt-6.1-terra"}
+        self.memory_manager = None
+
+    def run_conversation(self, **kwargs):
+        return {"final_response": "fixture model completion"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer", ["ordinary", "native_child"])
+@pytest.mark.parametrize("mismatch", [None, "provider", "model"])
+async def test_ordinary_and_native_terminal_receipts_validate_the_actual_sync_worker(
+    ordinary_locked_runtime, producer, mismatch,
+):
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.platforms import api_server as api_module
+    import time
+    adapter, db, state = ordinary_locked_runtime
+    db.create_session("receipt-parent", "api_server")
+    db.create_session("receipt-child", "api_server", parent_session_id="receipt-parent")
+    if producer == "ordinary":
+        async with TestClient(TestServer(_ordinary_runs_app(adapter, state))) as client:
+            response = await client.post("/v1/runs", json=_ordinary_locked_body("receipt-child"),
+                                         headers=_ordinary_headers("receipt"))
+            assert response.status == 202
+            await response.json()
+            await asyncio.gather(*list(adapter._active_run_tasks.values()))
+    else:
+        plan = {"child_session_id": "receipt-child", "parent_session_id": "receipt-parent",
+                "model": "gpt-6.1-terra", "goal": "Run the derived task", "context": "Fixture data"}
+        adapter._set_run_status("run-native-receipt", "queued", session_id="receipt-child")
+        runs._schedule_linked_child(adapter, None, plan, "run-native-receipt", time.time(), _api_server=api_module)
+        await asyncio.gather(*list(adapter._active_run_tasks.values()))
+    assert len(state.launches) == 1
+    launch = state.launches[0]
+    assert launch.confirmed_runtime_lock is (producer == "ordinary")
+    assert launch.agent_kwargs["confirmed_runtime_lock"] is True
+    assert launch.agent_kwargs["model_options"] == {"reasoning": {"enabled": True, "effort": "high"}}
+    agent = _ServedFixtureAgent(launch.session_id, mismatch)
+
+    async def finish():
+        _, _, served = await asyncio.to_thread(
+            runs._run_agent_sync, adapter, launch, agent, lambda data: None, _api_server=api_module)
+        return await runs._final_run_runtime(adapter, launch, served)
+
+    if mismatch:
+        with pytest.raises(RuntimeError, match="runtime.*(mismatch|not served)"):
+            await finish()
+        assert "browser_model_lock" not in json.loads(db.get_session(launch.session_id)["model_config"] or "{}")
+    else:
+        runtime = await finish()
+        assert runtime["provider"] == "openai-codex" and runtime["model"] == "gpt-6.1-terra"
+        assert runtime["model_lock"] == "confirmed"
+        if producer == "ordinary":
+            assert runtime["requested"] == {"provider": "openai-codex", "model": "gpt-6.1-terra"}
+        else:
+            lock = json.loads(db.get_session(launch.session_id)["model_config"])["browser_model_lock"]
+            assert lock["confirmed"] is True and lock["model_options"]["reasoning"]["effort"] == "high"

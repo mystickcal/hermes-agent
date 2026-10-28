@@ -500,6 +500,9 @@ class _RunLaunch:
     request_profile: Any
     browser_control_principal: Any
     browser_control_transport_family: Any
+    requested_runtime: Optional[Dict[str, Any]] = None
+    route_source: str = "global"
+    confirmed_runtime_lock: bool = False
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -634,6 +637,61 @@ def _valid_run_idempotency_key(key):
     return len(key) <= 255 and all(33 <= ord(ch) <= 126 for ch in key)
 
 
+def _run_runtime_selection(self, body, session_id, gateway_session_key, *, _api_server):
+    runtime_request = self._session_runtime_request_from_body(body)
+    lock_error = self._runtime_lock_error(runtime_request)
+    if lock_error is not None:
+        return runtime_request, False, None, None, lock_error
+    lock_active = bool(runtime_request.get("require_model_lock"))
+    if lock_active:
+        route_error = _runtime_lock_route_error(runtime_request)
+        if route_error is not None:
+            return runtime_request, True, None, None, _json_error(_api_server._openai_error, route_error, status=400)
+        requested = runtime_request.get("requested") or {}
+        route = runtime_request.get("route")
+        agent_overrides = {}
+        for src_key, dst_key in (("model", "requested_model"), ("provider", "requested_provider")):
+            if requested.get(src_key):
+                agent_overrides[dst_key] = requested[src_key]
+        if runtime_request.get("model_options"):
+            agent_overrides["model_options"] = runtime_request["model_options"]
+    else:
+        route = self._resolve_route(body.get("model"))
+        agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
+        selection_error = self._request_route_conflict_error(
+            session_id=session_id, gateway_session_key=gateway_session_key,
+            requested_model=agent_overrides.get("requested_model"),
+            requested_provider=agent_overrides.get("requested_provider"), route=route)
+        if selection_error:
+            return runtime_request, False, None, None, _json_error(_api_server._openai_error, selection_error, status=400)
+    return runtime_request, lock_active, route, agent_overrides, None
+
+
+async def _resolve_run_target(self, session_id, gateway_session_key, lock_active, *, _api_server):
+    _declared_selected = not session_id and bool(gateway_session_key)
+    selected_session_id = session_id or (
+        await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
+        if _declared_selected else None)
+    # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
+    # history loads from it, the turn writes to it, and a detached delivery row persisted to it
+    # is what the next same-id run consumes below.
+    if selected_session_id:
+        selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+    if lock_active and selected_session_id:
+        owner_error = await _locked_run_live_owner_error(
+            self, str(selected_session_id), _api_server=_api_server)
+        if owner_error is not None:
+            return _declared_selected, selected_session_id, owner_error
+    return _declared_selected, selected_session_id, None
+
+
+async def _run_session_history(self, conversation_history, previous_response_id, selected_session_id):
+    session_history_delivery = not previous_response_id and not conversation_history
+    if not conversation_history and selected_session_id and not previous_response_id:
+        conversation_history = await self._conversation_history_for_session(str(selected_session_id))
+    return conversation_history, session_history_delivery
+
+
 async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
@@ -681,14 +739,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return history_err
     previous_response_id = body.get("previous_response_id")
     session_id = body.get("session_id") or stored_session_id
-    route = self._resolve_route(body.get("model"))
-    agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
-    selection_error = self._request_route_conflict_error(
-        session_id=session_id, gateway_session_key=gateway_session_key,
-        requested_model=agent_overrides.get("requested_model"),
-        requested_provider=agent_overrides.get("requested_provider"), route=route)
-    if selection_error:
-        return _json_error(_openai_error, selection_error, status=400)
+    runtime_request, lock_active, route, agent_overrides, selection_error = _run_runtime_selection(
+        self, body, session_id, gateway_session_key, _api_server=_api_server)
+    if selection_error is not None:
+        return selection_error
     # A lost-acceptance replay must resolve even while the original run holds the last
     # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
     if idempotency_key:
@@ -697,24 +751,25 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             retention_until=_room_retention_until(request))
         if outcome == "conflict" or (outcome == "reused" and record is not None):
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
+    # Resolve the provider only for a genuinely new run. A lost-acceptance retry must replay
+    # its durable record even when credentials have since expired or the provider resolver is
+    # temporarily unavailable; replay has no new runtime admission to validate.
+    provider_error = await _runtime_lock_provider_error(self, runtime_request, _api_server=_api_server)
+    if provider_error is not None:
+        return provider_error
     # Enforce concurrency only for a genuinely new run.
     limited = self._concurrency_limited_response()
     if limited is not None:
         return limited
-    run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
     # conversation > run_id (which would otherwise re-key every affinity surface per run).
     # An explicit or chained session owns its routing key and is never rebound to the header.
-    _declared_selected = not session_id and bool(gateway_session_key)
-    selected_session_id = session_id or (
-        await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
-        if _declared_selected else None)
-    # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
-    # history loads from it, the turn writes to it, and a detached delivery row persisted to it
-    # is what the next same-id run consumes below.
-    if selected_session_id:
-        selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+    _declared_selected, selected_session_id, owner_error = await _resolve_run_target(
+        self, session_id, gateway_session_key, lock_active, _api_server=_api_server)
+    if owner_error is not None:
+        return owner_error
+    run_id = f"run_{uuid.uuid4().hex}"
+    self._run_owners[run_id] = self._run_idempotency_scope(request)
     session_id = selected_session_id or run_id
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
@@ -724,9 +779,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # nothing persisted to load yet.  Wake authority is fixed here, before the load can
     # overwrite ``conversation_history``: a caller-supplied history is authoritative for this
     # turn, never consumes the SessionDB delivery row, and is denied on the same contract.
-    session_history_delivery = not previous_response_id and not conversation_history
-    if not conversation_history and selected_session_id and not previous_response_id:
-        conversation_history = await self._conversation_history_for_session(str(selected_session_id))
+    conversation_history, session_history_delivery = await _run_session_history(
+        self, conversation_history, previous_response_id, selected_session_id)
     q = self._run_streams[run_id] = _RunStream()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
@@ -743,22 +797,30 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    agent_kwargs = dict(
+        ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
+        route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
+        **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")})
+    if lock_active:
+        agent_kwargs["confirmed_runtime_lock"] = True
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
-        agent_kwargs=dict(
-            ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
-            route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
-            **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
+        agent_kwargs=agent_kwargs,
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
+        requested_runtime=(dict(runtime_request.get("requested") or {}) if lock_active else None),
+        route_source=(runtime_request.get("route_source") or "global") if lock_active else "global",
+        confirmed_runtime_lock=lock_active,
         turn_author=turn_author)
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
+    admitted = (
+        await self._admit_to_live_bot_chat(session_id, user_message, turn_author)
+        if selected_session_id and not lock_active else None)
     if admitted is not None:
         task = self._active_run_tasks[run_id] = asyncio.create_task(
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
@@ -904,6 +966,7 @@ def _schedule_linked_child(self, request, plan, run_id, created, *, _api_server)
     launch = _RunLaunch(
         self, run_id, queue, plan["child_session_id"], None, False, plan["goal"], [], True,
         agent_kwargs={"session_id": plan["child_session_id"], "ephemeral_system_prompt": instructions,
+                      "room_dispatch": None, "room_execution_policy": None,
                       "requested_provider": "openai-codex", "requested_model": plan["model"],
                       "model_options": {"reasoning": {"enabled": True, "effort": "high"}},
                       "confirmed_runtime_lock": True},
@@ -944,6 +1007,21 @@ def _persist_confirmed_run_runtime(self, run):
         raise RuntimeError("Confirmed native runtime receipt could not be persisted")
 
 
+async def _final_run_runtime(self, run, served_runtime):
+    # Existing ordinary locked runs already validated their full runtime in _run_agent_sync.
+    if run.confirmed_runtime_lock:
+        return served_runtime
+    requested = {key: run.agent_kwargs.get(f"requested_{key}") for key in ("provider", "model")}
+    lock = _confirmed_run_runtime(run, served_runtime)
+    if lock:
+        await asyncio.to_thread(_persist_confirmed_run_runtime, self, run)
+    return self._sanitize_runtime_metadata(
+        runtime=served_runtime, model_lock=lock,
+        requested_runtime=requested if any(requested.values()) else None,
+        route_source=("model_routes" if run.agent_kwargs.get("route")
+                      else "raw_request" if any(requested.values()) else "global"))
+
+
 def _confirmed_run_runtime(run, served_runtime):
     if not run.agent_kwargs.get("confirmed_runtime_lock"):
         return ""
@@ -973,6 +1051,169 @@ def _served_runtime(agent) -> Dict[str, str]:
         value = getattr(agent, key, "")
         pair[key] = value if isinstance(value, str) else ""
     return pair
+
+
+def _runtime_provider_identity(provider: Any) -> str:
+    """Return the registered provider identity used for lock comparisons."""
+    normalized = "" if provider is None else str(provider).strip().lower()
+    if not normalized:
+        return ""
+    if normalized == "codex":
+        return "openai-codex"
+    try:
+        from hermes_cli.auth import _plugin_aliases
+        return str(_plugin_aliases().get(normalized, normalized)).strip().lower()
+    except Exception:
+        logger.exception("Runtime provider aliases unavailable (details redacted)",
+                         exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+                         stack_info=True)
+        try:
+            from hermes_cli.auth import _PROVIDER_ALIASES
+            return str(_PROVIDER_ALIASES.get(normalized, normalized)).strip().lower()
+        except Exception:
+            logger.exception("Runtime provider alias fallback unavailable (details redacted)",
+                             exc_info=(RuntimeError, RuntimeError("Native boundary error (details redacted)"), None),
+                             stack_info=True)
+            return normalized
+
+
+def _runtime_lock_route_error(runtime_request: Dict[str, Any]) -> Optional[str]:
+    """Reject route/provider and route-transport ambiguity for a confirmed lock.
+
+    The normal request conflict helper deliberately lets a session ``/model`` override win.  A
+    confirmed lock cannot inherit that exception: route credentials/base URLs would otherwise
+    replace the provider resolver's authenticated transport after preflight, and the Desktop
+    session override can silently change the selected provider.  A locked run therefore requires
+    one provider identity and provider-owned credentials.
+    """
+    if not runtime_request.get("require_model_lock"):
+        return None
+    requested = runtime_request.get("requested") or {}
+    route = runtime_request.get("route") if isinstance(runtime_request.get("route"), dict) else {}
+    request_provider = str(requested.get("provider") or "").strip()
+    route_provider = str(route.get("provider") or "").strip()
+    route_alias = str(requested.get("raw_model") or requested.get("model") or "requested model").strip()
+    if request_provider and route_provider and (
+        _runtime_provider_identity(request_provider) != _runtime_provider_identity(route_provider)
+    ):
+        return (
+            f"Model route '{route_alias}' is pinned to provider '{route_provider}'. "
+            f"Remove 'provider' or use '{route_provider}'.")
+    if str(route.get("api_key") or "").strip() or str(route.get("base_url") or "").strip():
+        return (
+            f"Model route '{route_alias}' pins route credentials/base_url. "
+            "Confirmed model locks must use the selected provider's resolved transport.")
+    return None
+
+
+async def _runtime_lock_provider_error(self, runtime_request: Dict[str, Any], *, _api_server) -> Optional["web.Response"]:
+    """Resolve an explicit lock provider before a run reserves admission state.
+
+    ``_runtime_lock_error`` validates the request shape and route.  The native session path
+    resolves provider credentials while constructing the agent; a durable run must do the same
+    check before it can be admitted, because its 202 response starts work asynchronously.  A
+    provider that resolves to a different registered identity is not a confirmed provider lock.
+    The resolver may refresh credentials or read the provider registry, so this check runs in a
+    worker thread before admission rather than on the aiohttp event loop.
+    """
+    if not runtime_request.get("require_model_lock"):
+        return None
+    requested = runtime_request.get("requested") or {}
+    route = runtime_request.get("route") if isinstance(runtime_request.get("route"), dict) else {}
+    provider = self._clean_runtime_id(
+        requested.get("provider") or route.get("provider"), max_len=80)
+    if not provider:
+        return None
+    model = self._clean_runtime_id(route.get("model") or requested.get("model"))
+    try:
+        runtime = await asyncio.to_thread(
+            self._resolve_provider_runtime,
+            provider, target_model=model or None, required=True)
+    except Exception:
+        logger.warning(
+            "[api_server] rejecting model-locked run: provider resolution failed for %s",
+            provider, exc_info=True)
+        return _json_error(
+            _api_server._openai_error,
+            f"Requested model lock provider '{provider}' could not be resolved; refusing fallback",
+            code="model_lock_unavailable", status=409)
+    resolved_provider = self._clean_runtime_id(
+        runtime.get("provider") if isinstance(runtime, dict) else None, max_len=80)
+    requested_identity = _runtime_provider_identity(provider)
+    resolved_identity = _runtime_provider_identity(resolved_provider)
+    if not resolved_provider or (
+        requested_identity != "auto" and requested_identity != resolved_identity
+    ):
+        return _json_error(
+            _api_server._openai_error,
+            f"Requested model lock provider '{provider}' did not resolve to its locked runtime; refusing fallback",
+            code="model_lock_unavailable", status=409)
+    return None
+
+
+async def _locked_run_live_owner_error(
+    self, session_id: str, *, _api_server
+) -> Optional["web.Response"]:
+    """Refuse a locked run when the canonical Desktop Bot Chat owns this session.
+
+    ``_admit_to_live_bot_chat`` transfers the turn to the owner's mailbox, where the Desktop
+    independently chooses its runtime.  A locked run cannot use that route, so inspect the same
+    owner lineage before creating any run state and fail closed without writing a delivery row.
+    """
+    try:
+        db = await self._ensure_session_db_async()
+    except Exception:
+        logger.warning(
+            "[api_server] could not inspect live Bot Chat owner for locked run session=%s",
+            session_id, exc_info=True)
+        return _json_error(
+            _api_server._openai_error,
+            "Could not prove the locked run has no live Desktop Bot Chat owner",
+            code="model_lock_unavailable", status=409)
+    if db is None:
+        return _json_error(
+            _api_server._openai_error,
+            "Could not prove the locked run has no live Desktop Bot Chat owner",
+            code="model_lock_unavailable", status=409)
+    try:
+        from hermes_state import SessionDB
+
+        canonical = await asyncio.to_thread(
+            db.get_session_by_title, SessionDB.CANONICAL_BOT_CHAT_TITLE)
+        if canonical is None:
+            return None
+        if not isinstance(canonical, dict) or not canonical.get("id"):
+            raise RuntimeError("canonical Bot Chat row has no session id")
+        canonical_id = str(canonical["id"])
+
+        def _lineage_ids(value, *, label: str) -> set[str]:
+            if not isinstance(value, (list, tuple, set)):
+                raise RuntimeError(f"{label} is not a session-id sequence")
+            ids = {str(item).strip() for item in value if str(item).strip()}
+            if not ids:
+                raise RuntimeError(f"{label} is empty")
+            return ids
+
+        canonical_chain = await asyncio.to_thread(db.get_compression_chain, canonical_id)
+        selected_lineage = await asyncio.to_thread(
+            db.get_compression_lineage, str(session_id))
+        canonical_ids = _lineage_ids(canonical_chain, label="canonical compression chain")
+        selected_ids = _lineage_ids(selected_lineage, label="selected compression lineage")
+        canonical_ids.add(canonical_id)
+    except Exception:
+        logger.warning(
+            "[api_server] could not inspect live Bot Chat lineage for locked run session=%s",
+            session_id, exc_info=True)
+        return _json_error(
+            _api_server._openai_error,
+            "Could not prove the locked run has no live Desktop Bot Chat owner",
+            code="model_lock_unavailable", status=409)
+    if not canonical_ids.intersection(selected_ids):
+        return None
+    return _json_error(
+        _api_server._openai_error,
+        "Locked runs cannot target the canonical Bot Chat lineage with an independently selected runtime",
+        code="model_lock_unavailable", status=409)
 
 
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
@@ -1041,7 +1282,18 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
-        return r, _run_usage(agent), _served_runtime(agent)
+        served_runtime = _served_runtime(agent)
+        if run.confirmed_runtime_lock:
+            # Reuse the native session contract: expose the actual served pair and reject a
+            # successful-looking turn if the agent did not keep the confirmed provider/model.
+            served_runtime = self._turn_runtime_metadata(
+                agent,
+                route=run.agent_kwargs.get("route"),
+                requested_runtime=run.requested_runtime,
+                route_source=run.route_source,
+                confirmed_runtime_lock=True,
+            )
+        return r, _run_usage(agent), served_runtime
 
 
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
@@ -1175,16 +1427,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         else:
             # ``runtime`` rides on both the pollable status and the run.completed event via _finish, in the
             # canonical shape every other api_server surface emits (route_source/requested, cleaned ids).
-            requested = {k: run.agent_kwargs.get(f"requested_{k}") for k in ("provider", "model")}
-            lock = _confirmed_run_runtime(run, served_runtime)
-            if lock:
-                await asyncio.to_thread(_persist_confirmed_run_runtime, self, run)
-            served_runtime = self._sanitize_runtime_metadata(
-                runtime=served_runtime, model_lock=lock,
-                requested_runtime=requested if any(requested.values()) else None,
-                route_source=("model_routes" if run.agent_kwargs.get("route")
-                              else "raw_request" if any(requested.values()) else "global"))
-            _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
+            runtime = await _final_run_runtime(self, run, served_runtime)
+            _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=runtime)
     except asyncio.CancelledError:
         _finish("cancelled")
         raise
