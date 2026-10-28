@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from hermes_state import SessionDB
@@ -68,4 +70,34 @@ def test_passive_receipt_refuses_untrusted_row_shape_and_missing_session(db):
         db.append_messages_with_receipt(
             "missing", [{"role": "user", "content": "hello"}],
             producer="passive.ingress.v1", event_id="event-1", origin_turn_id="turn-1",
+        )
+
+
+def test_passive_receipt_concurrent_replay_inserts_one_canonical_turn(db):
+    def append_once():
+        other = SessionDB(db.db_path)
+        return other.append_messages_with_receipt(
+            "voice-session", [{"role": "user", "content": "same"}],
+            producer="passive.ingress.v1", event_id="event-concurrent", origin_turn_id="turn-1",
+        )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = list(pool.map(lambda _: append_once(), range(2)))
+    assert sorted(receipt["replayed"] for receipt in receipts) == [False, True]
+    assert len(db.get_messages("voice-session")) == 1
+
+
+def test_passive_receipt_tracks_native_counters_and_refuses_deleted_replay(db):
+    db.append_messages_with_receipt(
+        "voice-session", [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
+        producer="passive.ingress.v1", event_id="event-delete", origin_turn_id="turn-1",
+    )
+    assert db.get_resume_message_count("voice-session") == 2
+    db.delete_session("voice-session")
+    assert db.get_message_receipt(
+        "voice-session", producer="passive.ingress.v1", event_id="event-delete"
+    ) is None
+    with pytest.raises(ValueError, match="does not exist"):
+        db.append_messages_with_receipt(
+            "voice-session", [{"role": "user", "content": "one"}],
+            producer="passive.ingress.v1", event_id="event-delete", origin_turn_id="turn-1",
         )
