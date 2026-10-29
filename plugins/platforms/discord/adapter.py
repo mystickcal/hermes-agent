@@ -6509,6 +6509,7 @@ def _define_discord_view_classes() -> None:
         async def _finalize_embed(self, interaction: discord.Interaction, color, footer: str) -> None:
             """Mark resolved, stamp the embed (color + footer), disable buttons, edit in place."""
             self.resolved = True
+            self.stop()
             embed = self._first_embed(interaction.message)
             if embed:
                 embed.color = color
@@ -6533,6 +6534,8 @@ def _define_discord_view_classes() -> None:
                     item.label = _t_discord(key, _DISCORD_BUTTON_LABEL_LIMIT)
 
         async def on_timeout(self):
+            if self.resolved:
+                return
             self.resolved = True
             self._disable_all()
             await self._expire_embed(t("platform.discord.prompt.expired_footer"))
@@ -7003,6 +7006,7 @@ def _define_discord_view_classes() -> None:
         async def _finish(self, interaction: "discord.Interaction", color, footer: str, *, log_edit_failure: bool) -> None:
             """Disable the buttons and stamp the embed; fall back to a bare defer."""
             self.resolved = True
+            self.stop()
             self._disable_all()
             embed = self._first_embed(interaction.message) if interaction.message else None
             if embed:
